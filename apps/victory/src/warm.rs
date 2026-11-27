@@ -205,22 +205,25 @@ fn child(mut process: Child, mut each: impl FnMut(usize, f64, bool)) -> Result<O
         anyhow::bail!("warm worker stdout unavailable");
     };
     let process = Mutex::new(process);
-    let (heard, over) = (Mutex::new(Instant::now()), AtomicBool::new(false));
+    let state = (Mutex::new((false, Instant::now())), std::sync::Condvar::new());
     let hung = AtomicBool::new(false);
     let mut made = 0;
     std::thread::scope(|s| {
         s.spawn(|| {
-            while !over.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(500));
-                if lock(&heard).elapsed() > LONGEST {
+            let (mu, cv) = &state;
+            let mut guard = lock(mu);
+            while !guard.0 {
+                let left = LONGEST.saturating_sub(guard.1.elapsed());
+                if left.is_zero() {
                     hung.store(true, Ordering::Relaxed);
                     let _ = lock(&process).kill();
                     return;
                 }
+                guard = cv.wait_timeout(guard, left).unwrap_or_else(|e| e.into_inner()).0;
             }
         });
         for line in BufReader::new(out).lines().map_while(Result::ok) {
-            *lock(&heard) = Instant::now();
+            lock(&state.0).1 = Instant::now();
             let mut words = line.split(' ');
             if words.next() == Some("made")
                 && let (Some(n), Some(ms), Some(there)) = (words.next(), words.next(), words.next())
@@ -230,7 +233,8 @@ fn child(mut process: Child, mut each: impl FnMut(usize, f64, bool)) -> Result<O
                 each(n, ms, there == "1");
             }
         }
-        over.store(true, Ordering::Relaxed);
+        lock(&state.0).0 = true;
+        state.1.notify_one();
     });
     let status = lock(&process).wait();
     let well = status.as_ref().is_ok_and(|s| s.success());

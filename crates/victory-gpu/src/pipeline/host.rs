@@ -1100,7 +1100,18 @@ fn root_signature(
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-        Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+        static ROOT_SIGS: std::sync::OnceLock<
+            std::sync::RwLock<std::collections::HashMap<(usize, blake3::Hash), ID3D12RootSignature>>,
+        > = std::sync::OnceLock::new();
+        let cache = ROOT_SIGS.get_or_init(Default::default);
+        let key = (windows::core::Interface::as_raw(device) as usize, blake3::hash(bytes));
+        if let Some(existing) = cache.read().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            return Ok((existing.clone(), bytes.to_vec()));
+        }
+        let created: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+        let mut map = cache.write().unwrap_or_else(|e| e.into_inner());
+        let root = map.entry(key).or_insert(created).clone();
+        Ok((root, bytes.to_vec()))
     }
 }
 

@@ -215,12 +215,24 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         None => Vec::new(),
     };
     let host = crate::shader_cache::host_shader(container)?;
-    let stores = programs.is_empty() || programs.iter().any(stores);
+    let (stores, stores_by_address) = if programs.is_empty() {
+        (true, true)
+    } else {
+        let (mut any, mut by_addr) = (false, false);
+        for program in &programs {
+            let (s, a) = analyze_stores(program);
+            any |= s;
+            by_addr |= a;
+            if any && by_addr {
+                break;
+            }
+        }
+        (any, by_addr)
+    };
     let threads = programs.iter().find_map(|p| match &p.io {
         victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
         _ => None,
     });
-    let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -376,42 +388,36 @@ pub(crate) fn builder_runs() -> bool {
 /// count: neither reaches a buffer's host copy. After upstream #413,
 /// which leaves scalar-memory stores out and counts image stores.
 #[cfg(windows)]
-fn stores(program: &victory_shader::NativeProgram) -> bool {
+fn analyze_stores(program: &victory_shader::NativeProgram) -> (bool, bool) {
     use victory_shader::gfx10::{Encoding, decode};
     let Ok(code) = decode(&program.code) else {
-        return true;
+        return (true, true);
     };
-    code.iter().any(|i| {
+    let mut any_store = false;
+    for i in &code {
         let name = i.name();
         match i.encoding {
-            Encoding::Mubuf
-            | Encoding::Mtbuf
-            | Encoding::Smem
-            | Encoding::Flat
-            | Encoding::Global => name.is_none_or(|n| {
-                (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
-            }),
-            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
-            _ => false,
+            Encoding::Flat | Encoding::Global => {
+                if name.is_none_or(|n| (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")) {
+                    return (true, true);
+                }
+            }
+            Encoding::Mubuf | Encoding::Mtbuf | Encoding::Smem => {
+                if !any_store
+                    && name.is_none_or(|n| (n.contains("store") || n.contains("atomic")) && !n.contains("scratch"))
+                {
+                    any_store = true;
+                }
+            }
+            Encoding::Sop1 => {
+                if !any_store && name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")) {
+                    any_store = true;
+                }
+            }
+            _ => {}
         }
-    })
-}
-
-/// Whether a console program can store to memory through raw addresses
-/// (`crate::memory`): a flat or global store or atomic, or code that does
-/// not decode. The programs that only walk ray-tracing structures do not,
-/// whatever they store through views.
-#[cfg(windows)]
-fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
-    use victory_shader::gfx10::{Encoding, decode};
-    let Ok(code) = decode(&program.code) else {
-        return true;
-    };
-    code.iter().any(|i| {
-        matches!(i.encoding, Encoding::Flat | Encoding::Global)
-            && i.name()
-                .is_none_or(|n| (n.contains("store") || n.contains("atomic")) && !n.contains("scratch"))
-    })
+    }
+    (any_store, false)
 }
 
 #[repr(C)]
