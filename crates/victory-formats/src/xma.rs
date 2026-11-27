@@ -200,13 +200,23 @@ struct Bits<'a> {
 }
 
 impl Bits<'_> {
+    #[inline(always)]
     fn peek32(&self) -> u32 {
-        let mut v = 0u64;
-        let byte = self.pos / 8;
-        for i in 0..5 {
-            v = v << 8 | *self.data.get(byte + i).unwrap_or(&0) as u64;
+        let byte = self.pos >> 3;
+        let shift = self.pos & 7;
+        if let Some(chunk) = self.data.get(byte..byte + 8) {
+            let v = u64::from_be_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3],
+                chunk[4], chunk[5], chunk[6], chunk[7],
+            ]);
+            ((v << shift) >> 32) as u32
+        } else {
+            let mut v = 0u64;
+            for i in 0..5 {
+                v = v << 8 | *self.data.get(byte + i).unwrap_or(&0) as u64;
+            }
+            (v << (24 + shift) >> 32) as u32
         }
-        (v << (24 + self.pos % 8) >> 32) as u32
     }
 
     fn read(&mut self, n: u32) -> u32 {
@@ -237,7 +247,12 @@ impl Bits<'_> {
 
 /// A prefix code built like FFmpeg's `ff_vlc_init_from_lengths`: codes are
 /// handed out in table order, each the next free one of its length.
+const VLC_FAST_BITS: u32 = 9;
+const VLC_FAST_LEN: usize = 1 << VLC_FAST_BITS;
+
 struct Vlc {
+    /// Direct 9-bit prefix lookup: (symbol, bit length), length 0 means fallback to `codes`.
+    fast: [(i16, u8); VLC_FAST_LEN],
     /// Left-aligned code, length, symbol; sorted by code.
     codes: Vec<(u32, u8, i32)>,
 }
@@ -246,15 +261,36 @@ impl Vlc {
     fn new(entries: impl Iterator<Item = (i32, u8)>) -> Vlc {
         let mut code = 0u64;
         let mut codes = Vec::new();
+        let mut fast = [(0i16, 0u8); VLC_FAST_LEN];
         for (symbol, len) in entries {
-            codes.push((code as u32, len, symbol));
+            let c = code as u32;
+            codes.push((c, len, symbol));
+            if u32::from(len) <= VLC_FAST_BITS
+                && let Ok(sym16) = i16::try_from(symbol)
+            {
+                let start = (c >> (32 - VLC_FAST_BITS)) as usize;
+                let count = 1usize << (VLC_FAST_BITS - u32::from(len));
+                fast[start..start + count].fill((sym16, len));
+            }
             code += 1 << (32 - len);
         }
-        Vlc { codes }
+        Vlc { fast, codes }
     }
 
+    #[inline(always)]
     fn read(&self, bits: &mut Bits) -> i32 {
         let v = bits.peek32();
+        let (sym, len) = self.fast[(v >> (32 - VLC_FAST_BITS)) as usize];
+        if len != 0 {
+            bits.pos += len as usize;
+            return i32::from(sym);
+        }
+        self.read_slow(v, bits)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn read_slow(&self, v: u32, bits: &mut Bits) -> i32 {
         let i = self.codes.partition_point(|c| c.0 <= v) - 1;
         let (_, len, symbol) = self.codes[i];
         bits.pos += len as usize;
@@ -1091,7 +1127,7 @@ impl Decoder {
                 for band in 0..self.num_bands {
                     let end = sfb[band + 1].min(subframe_len);
                     let exp = ch.quant_step - (ch.max_scale_factor - sf[band]) * ch.scale_factor_step;
-                    let quant = 10f32.powf(exp as f32 / 20.0);
+                    let quant = pow10_div20(exp);
                     for (t, &c) in tmp[sfb[band]..end].iter_mut().zip(&ch.coeffs[sfb[band]..end]) {
                         *t = c * quant;
                     }
@@ -1823,5 +1859,19 @@ mod tests {
             );
             assert!(errors == 0 && snr > 40.0);
         }
+    }
+}
+
+#[inline]
+fn pow10_div20(exp: i32) -> f32 {
+    static LUT: OnceLock<[f32; 512]> = OnceLock::new();
+    let idx = exp.wrapping_add(256);
+    if (0..512).contains(&idx) {
+        let table = LUT.get_or_init(|| {
+            std::array::from_fn(|i| 10f32.powf((i as i32 - 256) as f32 / 20.0))
+        });
+        table[idx as usize]
+    } else {
+        10f32.powf(exp as f32 / 20.0)
     }
 }

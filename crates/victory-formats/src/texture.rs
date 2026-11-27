@@ -312,7 +312,7 @@ impl Layout {
         let bpe = u64::from(d.element_bytes);
         let align = 256 / d.element_bytes;
         let three_d = d.dimension == Dimension::Tex3d;
-        let mut mips = vec![];
+        let mut mips = Vec::with_capacity(d.mips as usize);
         let mut offset = 0;
         for i in (0..d.mips).rev() {
             let h = padded_dim(d.height, i, d.block);
@@ -420,7 +420,7 @@ impl Layout {
                 fixed[0] /= b[0] / BLOCK_256_2D[2][0];
                 fixed[1] /= b[1] / BLOCK_256_2D[2][1];
             }
-            let mut sizes = vec![];
+            let mut sizes = [0u64; MAX_MIPS as usize];
             for i in 0..d.mips {
                 let (w, h) = padded(i);
                 if w <= fixed[0] && h <= fixed[1] && d.mips - i <= max_in_tail {
@@ -433,7 +433,7 @@ impl Layout {
                 let depth = mip_depth(i).next_multiple_of(block[2]);
                 let one = u64::from(pitch) * u64::from(rows) * bpe;
                 slice_size += one;
-                sizes.push(one * u64::from(block[2]));
+                sizes[i as usize] = one * u64::from(block[2]);
                 mips.push(Mip {
                     width: width(i),
                     height: height(i),
@@ -708,10 +708,179 @@ impl Layout {
             return Err(Error::TooSmall);
         }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
-        // The row and depth contribute one common base to every column, so
-        // the same contiguous runs repeat on every row, including mip tails.
+        if linear {
+            for z in 0..depth {
+                let (s, _) = self.split(first + z);
+                let base = u64::from(s) * self.slice_size + m.offset;
+                for y in 0..m.height {
+                    let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+                    let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
+                    copy_run::<DETILE>(src, dst, tiled_row as usize, linear_row, bytes);
+                }
+            }
+            return Ok(());
+        }
+
+        // Fast path for non-tail tiled mips: traverse one macro-block at a time
+        // so each 4 KiB / 64 KiB tiled block stays hot in L1/L2 across all its rows.
+        if m.tail.is_none() {
+            let [bw, bh, _] = self.block;
+            let block_bytes = self.alignment as usize;
+            let block_log2 = self.alignment.trailing_zeros();
+            let blocks_x = (m.pitch / bw) as usize;
+            if (bw as usize) <= 256 && (bh as usize) <= 256 && block_bytes.is_power_of_two() {
+                // Find the uniform intra-block contiguous run size for one full macro-block width.
+                let mut x_runs = [(0usize, 0usize); 64];
+                let mut run_count = 0usize;
+                let mut uniform = true;
+                let mut run_bytes = 0usize;
+                let mut first_lin = 0usize;
+                let mut first_off = self.pattern[0][0] as usize;
+                for lx in 1..bw as usize {
+                    let off = self.pattern[0][lx] as usize;
+                    let at = lx * n;
+                    if off != first_off + (at - first_lin) {
+                        let len = at - first_lin;
+                        if run_count >= x_runs.len()
+                            || (run_bytes != 0 && len != run_bytes)
+                            || !first_off.is_multiple_of(len)
+                        {
+                            uniform = false;
+                            break;
+                        }
+                        run_bytes = len;
+                        x_runs[run_count] = (first_off, len);
+                        run_count += 1;
+                        first_off = off;
+                        first_lin = at;
+                    }
+                }
+                if uniform {
+                    let last_len = (bw as usize) * n - first_lin;
+                    if run_count >= x_runs.len()
+                        || (run_bytes != 0 && last_len != run_bytes)
+                        || !first_off.is_multiple_of(last_len)
+                    {
+                        uniform = false;
+                    } else {
+                        run_bytes = last_len;
+                        x_runs[run_count] = (first_off, last_len);
+                        run_count += 1;
+                    }
+                }
+                if uniform
+                    && matches!(run_bytes, 4 | 8 | 16 | 32)
+                    && block_bytes.is_multiple_of(run_bytes)
+                    && (0..bh as usize).all(|ly| (self.pattern[1][ly] as usize).is_multiple_of(run_bytes))
+                    && (0..self.block[2] as usize).all(|lz| (self.pattern[2][lz] as usize).is_multiple_of(run_bytes))
+                {
+                    let mut x_chunks = [0u16; 64];
+                    for r in 0..run_count {
+                        x_chunks[r] = (x_runs[r].0 / run_bytes) as u16;
+                    }
+                    let mut y_chunks = [0usize; 256];
+                    for ly in 0..bh as usize {
+                        y_chunks[ly] = (self.pattern[1][ly] as usize) / run_bytes;
+                    }
+                    let x_full_slice = &x_chunks[..run_count];
+                    let full_bx = (m.width / bw) as usize;
+                    let rem_elems = (m.width % bw) as usize;
+                    let rem_bytes = rem_elems * n;
+                    let rem_full_runs = rem_bytes / run_bytes;
+                    let rem_tail_bytes = rem_bytes % run_bytes;
+                    let rem_tail_off = if rem_tail_bytes != 0 {
+                        x_runs[rem_full_runs].0
+                    } else {
+                        0
+                    };
+                    let bw_bytes = (bw as usize) * n;
+                    let mask = block_bytes / run_bytes - 1;
+                    let full_by = (m.height as usize).div_ceil(bh as usize);
+
+                    for z in 0..depth {
+                        let (s, inner) = self.split(first + z);
+                        let base = (u64::from(s) * self.slice_size + m.offset) as usize;
+                        let pz_chunk = (self.pattern[2][inner as usize] as usize) / run_bytes;
+                        let z_lin = z as usize * depth_pitch;
+                        for by in 0..full_by {
+                            let y0 = by * bh as usize;
+                            let y_count = (m.height as usize - y0).min(bh as usize);
+                            let row_block_base = base + ((by * blocks_x) << block_log2);
+                            let lin_y_base = z_lin + y0 * row_pitch;
+                            for bx in 0..full_bx {
+                                let block_off = row_block_base + (bx << block_log2);
+                                let lin_base = lin_y_base + bx * bw_bytes;
+                                match run_bytes {
+                                    4 => copy_macro_block::<4, DETILE>(
+                                        src, dst, block_off, block_bytes, mask, lin_base, row_pitch,
+                                        y_count, &y_chunks, pz_chunk, x_full_slice,
+                                    ),
+                                    8 => copy_macro_block::<8, DETILE>(
+                                        src, dst, block_off, block_bytes, mask, lin_base, row_pitch,
+                                        y_count, &y_chunks, pz_chunk, x_full_slice,
+                                    ),
+                                    16 => copy_macro_block::<16, DETILE>(
+                                        src, dst, block_off, block_bytes, mask, lin_base, row_pitch,
+                                        y_count, &y_chunks, pz_chunk, x_full_slice,
+                                    ),
+                                    32 => copy_macro_block::<32, DETILE>(
+                                        src, dst, block_off, block_bytes, mask, lin_base, row_pitch,
+                                        y_count, &y_chunks, pz_chunk, x_full_slice,
+                                    ),
+                                    _ => unreachable!(),
+                                }
+                            }
+                            if rem_elems != 0 {
+                                let block_off = row_block_base + (full_bx << block_log2);
+                                let lin_base = lin_y_base + full_bx * bw_bytes;
+                                if rem_full_runs != 0 {
+                                    let x_part = &x_chunks[..rem_full_runs];
+                                    match run_bytes {
+                                        4 => copy_macro_block::<4, DETILE>(
+                                            src, dst, block_off, block_bytes, mask, lin_base, row_pitch,
+                                            y_count, &y_chunks, pz_chunk, x_part,
+                                        ),
+                                        8 => copy_macro_block::<8, DETILE>(
+                                            src, dst, block_off, block_bytes, mask, lin_base, row_pitch,
+                                            y_count, &y_chunks, pz_chunk, x_part,
+                                        ),
+                                        16 => copy_macro_block::<16, DETILE>(
+                                            src, dst, block_off, block_bytes, mask, lin_base, row_pitch,
+                                            y_count, &y_chunks, pz_chunk, x_part,
+                                        ),
+                                        32 => copy_macro_block::<32, DETILE>(
+                                            src, dst, block_off, block_bytes, mask, lin_base, row_pitch,
+                                            y_count, &y_chunks, pz_chunk, x_part,
+                                        ),
+                                        _ => unreachable!(),
+                                    }
+                                }
+                                if rem_tail_bytes != 0 {
+                                    let pz_byte = self.pattern[2][inner as usize] as usize;
+                                    let lin_tail = lin_base + rem_full_runs * run_bytes;
+                                    for ly in 0..y_count {
+                                        let tiled_off = block_off
+                                            + (self.pattern[1][ly] as usize | pz_byte | rem_tail_off);
+                                        copy_run::<DETILE>(
+                                            src,
+                                            dst,
+                                            tiled_off,
+                                            lin_tail + ly * row_pitch,
+                                            rem_tail_bytes,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
+        // General path (mip tails and non-uniform patterns).
         let mut runs = Vec::new();
-        if !linear {
+        {
             let mut first_linear = 0;
             let mut first_tiled = self.column(m, 0) as usize;
             for x in 1..m.width {
@@ -737,28 +906,73 @@ impl Layout {
             let base = u64::from(s) * self.slice_size + m.offset;
             for y in 0..m.height {
                 let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
-                if linear {
-                    let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
-                    copy_run::<DETILE>(src, dst, tiled_row as usize, linear_row, bytes);
-                } else {
-                    let tiled_row = (base + self.row(m, y, inner)) as usize;
-                    match chunk_size {
-                        Some(8) if tiled_row.is_multiple_of(8) => {
-                            copy_runs::<8, DETILE>(src, dst, body, tiled_row, linear_row)
-                        }
-                        Some(16) if tiled_row.is_multiple_of(16) => {
-                            copy_runs::<16, DETILE>(src, dst, body, tiled_row, linear_row)
-                        }
-                        Some(32) if tiled_row.is_multiple_of(32) => {
-                            copy_runs::<32, DETILE>(src, dst, body, tiled_row, linear_row)
-                        }
-                        _ => copy_runs::<0, DETILE>(src, dst, body, tiled_row, linear_row),
+                let tiled_row = (base + self.row(m, y, inner)) as usize;
+                match chunk_size {
+                    Some(4) if tiled_row.is_multiple_of(4) => {
+                        copy_runs::<4, DETILE>(src, dst, body, tiled_row, linear_row)
                     }
-                    copy_runs::<0, DETILE>(src, dst, last, tiled_row, linear_row);
+                    Some(8) if tiled_row.is_multiple_of(8) => {
+                        copy_runs::<8, DETILE>(src, dst, body, tiled_row, linear_row)
+                    }
+                    Some(16) if tiled_row.is_multiple_of(16) => {
+                        copy_runs::<16, DETILE>(src, dst, body, tiled_row, linear_row)
+                    }
+                    Some(32) if tiled_row.is_multiple_of(32) => {
+                        copy_runs::<32, DETILE>(src, dst, body, tiled_row, linear_row)
+                    }
+                    _ => copy_runs::<0, DETILE>(src, dst, body, tiled_row, linear_row),
                 }
+                copy_runs::<0, DETILE>(src, dst, last, tiled_row, linear_row);
             }
         }
         Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn copy_macro_block<const N: usize, const DETILE: bool>(
+    src: &[u8],
+    dst: &mut [u8],
+    block_off: usize,
+    block_bytes: usize,
+    mask: usize,
+    linear_base: usize,
+    row_pitch: usize,
+    y_count: usize,
+    y_chunks: &[usize],
+    pz_chunk: usize,
+    x_chunks: &[u16],
+) {
+    let row_bytes = x_chunks.len() * N;
+    if DETILE {
+        let block = src[block_off..block_off + block_bytes].as_chunks::<N>().0;
+        if block.len() != mask + 1 {
+            return;
+        }
+        for ly in 0..y_count {
+            let y_base = y_chunks[ly] | pz_chunk;
+            let linear = dst[linear_base + ly * row_pitch..][..row_bytes]
+                .as_chunks_mut::<N>()
+                .0;
+            for (out, &xc) in linear.iter_mut().zip(x_chunks) {
+                *out = block[(y_base | xc as usize) & mask];
+            }
+        }
+    } else {
+        let block = dst[block_off..block_off + block_bytes].as_chunks_mut::<N>().0;
+        if block.len() != mask + 1 {
+            return;
+        }
+        for ly in 0..y_count {
+            let y_base = y_chunks[ly] | pz_chunk;
+            let linear = src[linear_base + ly * row_pitch..][..row_bytes]
+                .as_chunks::<N>()
+                .0;
+            for (input, &xc) in linear.iter().zip(x_chunks) {
+                block[(y_base | xc as usize) & mask] = *input;
+            }
+        }
     }
 }
 
