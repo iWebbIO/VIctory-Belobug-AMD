@@ -3247,15 +3247,15 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
             }
         }
     }
+    UNDER_SCAN.fetch_add(scanning.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    filter_stale_spans(spans)
+}
+
+fn filter_stale_spans(
+    mut spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
     if late_exact() {
-        // The title's bytes are put in beside the flights' writes; a
-        // settle is still due where that could not be done. At most this
-        // many changed runs go up to copies in the card's memory, each a
-        // copy of its own there. With [`card_steps`] the pages of the
-        // title's ring of constants come here too, which were waited for
-        // before: hundreds of short runs each, at about 1.5 us a run.
         let mut runs_left = if card_steps::stage() > 0 { 4096 } else { 512 };
-        UNDER_SCAN.fetch_add(scanning.elapsed().as_nanos() as u64, Ordering::Relaxed);
         spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
         return spans;
     }
@@ -5820,20 +5820,42 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
-            let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
+            let mut ranges: Vec<(usize, usize)> = Vec::new();
+            let mut stale_spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+            let mut seen: ByCopy<(Option<usize>, Option<usize>)> = ByCopy::default();
+            let mut last: (usize, Option<usize>, Option<usize>) = (0, None, None);
             for list in runs {
                 for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && shadow.asked_ahead()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                    if let Step::Refresh(shadow, address, len) = step {
+                        let key = std::sync::Arc::as_ptr(shadow) as usize;
+                        let (ask_i, stale_i) = if key == last.0 {
+                            (last.1, last.2)
+                        } else {
+                            let entry = *seen.entry(key).or_insert_with(|| {
+                                let a = shadow.asked_ahead().then(|| {
+                                    ranges.push((*address, *address + *len));
+                                    ranges.len() - 1
+                                });
+                                let s = (behind && shadow.writes_pending()).then(|| {
+                                    stale_spans.push((shadow.clone(), *address, *address + *len));
+                                    stale_spans.len() - 1
+                                });
+                                (a, s)
+                            });
+                            last = (key, entry.0, entry.1);
+                            entry
+                        };
+                        if let Some(i) = ask_i {
+                            let r = &mut ranges[i];
+                            *r = (r.0.min(*address), r.1.max(*address + *len));
+                        }
+                        if let Some(i) = stale_i {
+                            let s = &mut stale_spans[i];
+                            (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len));
+                        }
                     }
                 }
             }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
@@ -5851,7 +5873,7 @@ impl Host {
                     upcheck::reads(runs);
                 }
             }
-            let stale = if behind { stale_under_flights(runs) } else { Vec::new() };
+            let stale = if behind { filter_stale_spans(stale_spans) } else { Vec::new() };
             if !stale.is_empty() {
                 let settling = std::time::Instant::now();
                 self.settle_stale(&mut submitted, runs, stale, &ranges);

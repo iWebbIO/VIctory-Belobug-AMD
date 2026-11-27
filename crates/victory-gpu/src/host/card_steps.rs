@@ -359,19 +359,26 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         let mut level = 0;
         // Behind what writes what this reads or writes, and, if this
         // writes, behind what reads it.
-        let ahead: Box<dyn Iterator<Item = usize>> =
-            if writes { Box::new(0..out.len()) } else { Box::new(copies.iter().copied()) };
-        for k in ahead {
-            let (j, at): (usize, u32) = out[k];
-            let Some((jr, jw)) = reads_writes(&does[j]) else {
-                continue;
-            };
-            if at >= level && (meet(jw, r) || meet(jw, w) || meet(jr, w)) {
-                level = at + 1;
-            }
-        }
         if writes {
+            for &(j, at) in &out {
+                if at >= level
+                    && let Some((jr, jw)) = reads_writes(&does[j])
+                    && (meet(jw, r) || meet(jw, w) || meet(jr, w))
+                {
+                    level = at + 1;
+                }
+            }
             copies.push(out.len());
+        } else if !copies.is_empty() {
+            for &k in &copies {
+                let (j, at) = out[k];
+                if at >= level
+                    && let Some((_, jw)) = reads_writes(&does[j])
+                    && meet(jw, r)
+                {
+                    level = at + 1;
+                }
+            }
         }
         out.push((i, level));
     }
@@ -760,7 +767,7 @@ impl Host {
                         to: dst + len,
                         copy: true,
                     });
-                    held.clear();
+                    held.retain(|&(s, l), _| !meet((s, s + l), (dst, dst + len)));
                     To::Copy(to, dst)
                 }
                 _ => match fill_to(runs, steps[i]) {

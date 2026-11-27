@@ -22,8 +22,11 @@ const ARENA: usize = 4 << 20;
 
 struct Arena {
     at: usize,
+    free: usize,
     /// Per block whether it is handed out.
     taken: Vec<bool>,
+    /// Per block whether it has ever been handed out before (fresh VirtualAlloc2 pages are OS-zeroed).
+    used_before: Vec<bool>,
 }
 
 static ARENAS: Mutex<Vec<Arena>> = Mutex::new(Vec::new());
@@ -32,8 +35,8 @@ static ARENAS: Mutex<Vec<Arena>> = Mutex::new(Vec::new());
 pub(crate) struct Upload(Kind);
 
 enum Kind {
-    /// Address, bytes.
-    Low(usize, usize),
+    /// Arena index, address, bytes.
+    Low(usize, usize, usize),
     Heap(Vec<u8>),
 }
 
@@ -93,30 +96,46 @@ impl Upload {
             return Some(Upload(Kind::Heap(vec![0; len])));
         }
         let n = len.max(1).div_ceil(BLOCK);
-        let mut arenas = ARENAS.lock().unwrap_or_else(|e| e.into_inner());
-        let found = arenas.iter().enumerate().find_map(|(a, arena)| Some((a, gap(&arena.taken, n)?)));
-        let (a, first) = match found {
-            Some(place) => place,
-            None => {
-                let blocks = n.max(ARENA / BLOCK);
-                let at = reserve(blocks * BLOCK)?;
-                crate::shadow::register(at, at as u64, (blocks * BLOCK) as u64);
-                tracing::info!(at = format_args!("{at:#x}"), bytes = blocks * BLOCK, "memory for lists' uploads, where shaders reach it by address");
-                arenas.push(Arena { at, taken: vec![false; blocks] });
-                (arenas.len() - 1, 0)
-            }
+        let (a, at, needs_zero) = {
+            let mut arenas = ARENAS.lock().unwrap_or_else(|e| e.into_inner());
+            let found = arenas
+                .iter()
+                .enumerate()
+                .filter(|(_, arena)| arena.free >= n)
+                .find_map(|(a, arena)| Some((a, gap(&arena.taken, n)?)));
+            let (a, first) = match found {
+                Some(place) => place,
+                None => {
+                    let blocks = n.max(ARENA / BLOCK);
+                    let at = reserve(blocks * BLOCK)?;
+                    crate::shadow::register(at, at as u64, (blocks * BLOCK) as u64);
+                    tracing::info!(at = format_args!("{at:#x}"), bytes = blocks * BLOCK, "memory for lists' uploads, where shaders reach it by address");
+                    arenas.push(Arena {
+                        at,
+                        free: blocks,
+                        taken: vec![false; blocks],
+                        used_before: vec![false; blocks],
+                    });
+                    (arenas.len() - 1, 0)
+                }
+            };
+            let arena = &mut arenas[a];
+            arena.taken[first..first + n].fill(true);
+            arena.free -= n;
+            let needs_zero = arena.used_before[first..first + n].iter().any(|&u| u);
+            arena.used_before[first..first + n].fill(true);
+            (a, arena.at + first * BLOCK, needs_zero)
         };
-        let arena = &mut arenas[a];
-        arena.taken[first..first + n].fill(true);
-        let at = arena.at + first * BLOCK;
-        // SAFETY: the blocks are the arena's and nobody else's now.
-        unsafe { std::ptr::write_bytes(at as *mut u8, 0, len) };
-        Some(Upload(Kind::Low(at, len)))
+        if needs_zero {
+            // SAFETY: the blocks are exclusively owned by this `Upload` now.
+            unsafe { std::ptr::write_bytes(at as *mut u8, 0, len) };
+        }
+        Some(Upload(Kind::Low(a, at, len)))
     }
 
     pub(crate) fn start(&mut self) -> *mut u8 {
         match &mut self.0 {
-            Kind::Low(at, _) => *at as *mut u8,
+            Kind::Low(_, at, _) => *at as *mut u8,
             Kind::Heap(block) => block.as_mut_ptr(),
         }
     }
@@ -124,11 +143,13 @@ impl Upload {
 
 impl Drop for Upload {
     fn drop(&mut self) {
-        let Kind::Low(at, len) = self.0 else { return };
+        let Kind::Low(a, at, len) = self.0 else { return };
+        let n = len.max(1).div_ceil(BLOCK);
         let mut arenas = ARENAS.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(arena) = arenas.iter_mut().find(|a| (a.at..a.at + a.taken.len() * BLOCK).contains(&at)) {
+        if let Some(arena) = arenas.get_mut(a) {
             let first = (at - arena.at) / BLOCK;
-            arena.taken[first..first + len.max(1).div_ceil(BLOCK)].fill(false);
+            arena.taken[first..first + n].fill(false);
+            arena.free += n;
         }
     }
 }
