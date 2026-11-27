@@ -230,7 +230,7 @@ unsafe impl Send for Idle {}
 /// four in ten a budget and an argument buffer (run 61: "104 host lists
 /// made 21.2 ms" a frame, and the graphics kernel's time to free them).
 #[cfg(windows)]
-static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
+static IDLE: std::sync::Mutex<(std::collections::VecDeque<Idle>, u64)> = std::sync::Mutex::new((std::collections::VecDeque::new(), 0));
 
 /// The most host lists kept idle (128 were too few: flights land several at
 /// a time, so lists were thrown away and others made in the same frame, with
@@ -255,7 +255,7 @@ fn pools() -> bool {
 fn fresh_list() -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        let taken = idle.0.pop();
+        let taken = idle.0.pop_back();
         if let Some(Idle(_, bytes)) = &taken {
             idle.1 -= bytes;
         }
@@ -272,6 +272,29 @@ fn fresh_list() -> Option<crate::host::HostList> {
 /// what they held is let go, as before, and the host lists are reset and
 /// kept for [`fresh_list`].
 #[cfg(windows)]
+pub(crate) fn trim(limit: usize) {
+    let mut dropped = Vec::new();
+    {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        while idle.0.len() > limit {
+            if let Some(Idle(list, bytes)) = idle.0.pop_front() {
+                idle.1 -= bytes;
+                dropped.push(list);
+            }
+        }
+    }
+    drop(dropped);
+}
+
+#[cfg(windows)]
+pub(crate) fn drop_back_list(this: This) {
+    if !this.is_null() {
+        // SAFETY: `Recording::drop` owns the boxed `List` exclusively.
+        unsafe { drop(Box::from_raw(this.cast_mut().cast::<List>())) };
+    }
+}
+
+#[cfg(windows)]
 pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
@@ -280,18 +303,24 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
         // goes, its allocators stay.
         host.reset();
         let bytes = host.scratch_kept();
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
-            idle.1 += bytes;
-        }
+        let reject = {
+            let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+            if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+                idle.0.push_back(Idle(host, bytes));
+                idle.1 += bytes;
+                None
+            } else {
+                Some(host)
+            }
+        };
+        drop(reject);
     }
 }
 
@@ -787,15 +816,20 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         }
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
-        let mut host: Vec<Barrier> = barriers
-            .iter()
-            .filter_map(|b| host_barrier(list, b))
-            .collect();
-        // Buffers have host copies, not resources the barrier can name:
-        // a barrier on one waits for every shader write before it.
-        if barriers.iter().any(|b| {
-            b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
-        }) {
+        let mut host: crate::draw::Few<Barrier, 16> = crate::draw::Few::new_with(UAV_BARRIER);
+        let mut needs_uav = false;
+        for b in barriers {
+            if let Some(hb) = host_barrier(list, b) {
+                host.push(hb);
+            } else if !needs_uav
+                && b.kind != 1
+                && !b.first.is_null()
+                && crate::resource::buffer_bytes(b.first).is_some()
+            {
+                needs_uav = true;
+            }
+        }
+        if needs_uav {
             host.push(UAV_BARRIER);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
@@ -1765,16 +1799,21 @@ mod state {
         one_range: i32,
         depth: *const u64,
     ) {
-        let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
+        let n = (count as usize).min(8);
+        let mut range = [0u64; 8];
+        let slice: &[u64] = if one_range != 0 && !handles.is_null() {
             // SAFETY: the title passes the first handle.
             let first = unsafe { *handles };
-            (0..u64::from(count)).map(|i| first + 128 * i).collect()
+            for (i, slot) in range[..n].iter_mut().enumerate() {
+                *slot = first + 128 * i as u64;
+            }
+            &range[..n]
         } else {
-            items(handles, count).to_vec()
+            items(handles, n as u32)
         };
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
-        with_state(this, |list, s| s.set_targets(list, &handles, depth));
+        with_state(this, |list, s| s.set_targets(list, slice, depth));
     }
     pub(super) extern "system" fn draw(
         this: This,

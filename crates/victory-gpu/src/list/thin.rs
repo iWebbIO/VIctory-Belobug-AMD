@@ -277,7 +277,14 @@ impl Drop for Recording {
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
-            held(&BACKS).push(inner.back);
+            const BACKS_MOST: usize = 32;
+            let mut backs = held(&BACKS);
+            if backs.len() < BACKS_MOST {
+                backs.push(inner.back);
+            } else {
+                drop(backs);
+                super::drop_back_list(inner.back as This);
+            }
         }
     }
 }

@@ -151,6 +151,12 @@ fn mirror(handle: u64) {
     };
     // Renderer port #2: its record is looked at again with the title's own.
     crate::port_descriptors::mark(handle);
+    if let Some(host) = heap.host.get() {
+        if let Some(host) = host {
+            host.mirror(index, handle, false);
+        }
+        return;
+    }
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
     match heap.host.get() {
         None => pending.push(index),

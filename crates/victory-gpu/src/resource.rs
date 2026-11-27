@@ -1879,7 +1879,7 @@ pub(crate) fn placed_known(address: u64, desc: &[u32; 14]) -> Option<This> {
     let mut key = *desc;
     key[1] = 0;
     key[13] = 0;
-    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let map = placed_shard(address).read().unwrap_or_else(|e| e.into_inner());
     map.get(&(address, key)).or_else(|| map.get(&(address, *desc))).map(|&r| r as This)
 }
 
@@ -2447,7 +2447,7 @@ impl Drop for HostTexture {
 /// (never released), for the memory line.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn placed_textures() -> u64 {
-    PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).len() as u64
+    placed_shards().iter().map(|s| s.read().unwrap_or_else(|e| e.into_inner()).len() as u64).sum()
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -3041,12 +3041,27 @@ pub(crate) extern "system" fn create_at_address(
 /// its host texture is let go when nothing names it any more
 /// ([`let_go_idle`]) and made again on the next use.
 #[cfg(windows)]
-static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+const PLACED_SHARDS: usize = 64;
+
+#[cfg(windows)]
+fn placed_shards() -> &'static [std::sync::RwLock<std::collections::HashMap<(u64, [u32; 14]), usize>>; PLACED_SHARDS] {
+    static SHARDS: std::sync::OnceLock<
+        [std::sync::RwLock<std::collections::HashMap<(u64, [u32; 14]), usize>>; PLACED_SHARDS],
+    > = std::sync::OnceLock::new();
+    SHARDS.get_or_init(|| std::array::from_fn(|_| std::sync::RwLock::new(std::collections::HashMap::new())))
+}
+
+#[cfg(windows)]
+#[inline]
+fn placed_shard(address: u64) -> &'static std::sync::RwLock<std::collections::HashMap<(u64, [u32; 14]), usize>> {
+    let idx = ((address >> 12) ^ (address >> 24)) as usize & (PLACED_SHARDS - 1);
+    &placed_shards()[idx]
+}
 
 /// The placed textures asked for with filler words set, as asked
 /// (address and description): for [`PLACED_TWINS`].
 #[cfg(windows)]
+#[cfg(feature = "diagnostics")]
 static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
@@ -3116,7 +3131,7 @@ pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
     let mut key = *desc;
     key[1] = 0;
     key[13] = 0;
-    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let map = placed_shard(address).read().unwrap_or_else(|e| e.into_inner());
     let found = map.get(&(address, key)).or_else(|| map.get(&(address, *desc)))?;
     Some(*found as This)
 }
@@ -3139,6 +3154,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     // that fills at world entry. They are not part of what a texture is.
     // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
     static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(feature = "diagnostics")]
     let raw = *desc;
     let mut key = *desc;
     if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
@@ -3146,9 +3162,11 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         key[13] = 0;
     }
     let desc = &key;
-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    // How many resources the filler alone would have added (a count for
-    // the log: `placed_filler_twins`).
+    let shard = placed_shard(address);
+    if let Some(&r) = shard.read().unwrap_or_else(|e| e.into_inner()).get(&(address, *desc)) {
+        return Some(r as This);
+    }
+    #[cfg(feature = "diagnostics")]
     if raw != key {
         let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert((address, raw)) {
@@ -3163,6 +3181,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
             }
         }
     }
+    let mut map = shard.write().unwrap_or_else(|e| e.into_inner());
     if let Some(&r) = map.get(&(address, *desc)) {
         return Some(r as This);
     }

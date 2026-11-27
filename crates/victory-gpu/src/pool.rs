@@ -66,6 +66,14 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         };
         pool.reclaim(tick, staging_limit, true);
     }
+    let list_limit = if crate::residency::critical_commit() {
+        0
+    } else if pressure {
+        32
+    } else {
+        128
+    };
+    crate::list::trim(list_limit);
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {

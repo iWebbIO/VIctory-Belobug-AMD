@@ -4234,13 +4234,7 @@ mod thread_tests {
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
 /// once.
-fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
-    static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
-        std::sync::Mutex::new(Vec::new());
-    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
-        return Some(s.clone());
-    }
+fn make_command_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     let argument = D3D12_INDIRECT_ARGUMENT_DESC {
         Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
         ..Default::default()
@@ -4264,7 +4258,36 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
         once!(error = %e, kind, stride, "host command signature refused");
         return None;
     }
-    let signature = signature?;
+    signature
+}
+
+fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
+    static CANONICAL: [std::sync::OnceLock<Option<ID3D12CommandSignature>>; 4] = [
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+    ];
+    let slot = match (kind, stride) {
+        (0, 16) => Some(0),
+        (1, 20) => Some(1),
+        (2, 12) => Some(2),
+        (10, 12) => Some(3),
+        _ => None,
+    };
+    if let Some(i) = slot {
+        return CANONICAL[i].get_or_init(|| make_command_signature(kind, stride)).clone();
+    }
+    static MADE: std::sync::RwLock<Vec<((u32, u32), ID3D12CommandSignature)>> =
+        std::sync::RwLock::new(Vec::new());
+    if let Some((_, s)) = MADE.read().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _)| *k == (kind, stride)) {
+        return Some(s.clone());
+    }
+    let signature = make_command_signature(kind, stride)?;
+    let mut made = MADE.write().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
+        return Some(s.clone());
+    }
     made.push(((kind, stride), signature.clone()));
     Some(signature)
 }
@@ -4323,7 +4346,10 @@ impl<T: Copy + Default, const N: usize> Default for Few<T, N> {
 }
 
 impl<T: Copy, const N: usize> Few<T, N> {
-    fn push(&mut self, what: T) {
+    pub(crate) fn new_with(fill: T) -> Self {
+        Few { few: [fill; N], len: 0, many: Vec::new() }
+    }
+    pub(crate) fn push(&mut self, what: T) {
         if self.many.is_empty() && self.len < N {
             self.few[self.len] = what;
             self.len += 1;
