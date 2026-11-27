@@ -51,21 +51,45 @@ pub(crate) fn in_place_on() -> bool {
 /// slots' constant buffers whose twin is a raw view.
 static STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
+thread_local! {
+    static LOCAL: std::cell::Cell<[u64; 6]> = const { std::cell::Cell::new([0; 6]) };
+}
+
+#[inline]
+fn bump(i: usize, n: u64, j: Option<(usize, u64)>) {
+    LOCAL.with(|c| {
+        let mut v = c.get();
+        v[i] += n;
+        if let Some((k, m)) = j {
+            v[k] += m;
+        }
+        v[5] += 1;
+        if v[5] >= 256 {
+            for (dst, &src) in STATS.iter().zip(&v[..5]) {
+                if src != 0 {
+                    dst.fetch_add(src, Relaxed);
+                }
+            }
+            v = [0; 6];
+        }
+        c.set(v);
+    });
+}
+
 /// A table's constant buffer of `size` bytes was given in place.
 pub(crate) fn in_place(size: u32) {
-    STATS[0].fetch_add(1, Relaxed);
-    STATS[1].fetch_add(u64::from(size), Relaxed);
+    bump(0, 1, Some((1, u64::from(size))));
 }
 
 /// A table's constant buffer was copied as before: `aligned` false when it
 /// is in place but not on 16 bytes.
 pub(crate) fn copied(aligned: bool) {
-    STATS[if aligned { 2 } else { 3 }].fetch_add(1, Relaxed);
+    bump(if aligned { 2 } else { 3 }, 1, None);
 }
 
 /// A title slot's constant buffer view got a raw twin.
 pub(crate) fn twinned() {
-    STATS[4].fetch_add(1, Relaxed);
+    bump(4, 1, None);
 }
 
 /// Whether a constant buffer at host address `gpu` can be a raw view of

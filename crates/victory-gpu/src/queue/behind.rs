@@ -45,6 +45,7 @@
 //! line.
 
 use std::collections::VecDeque;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -57,6 +58,15 @@ pub(super) trait Work: Send {
     type Ask;
     fn ask(&self) -> Option<Self::Ask>;
     fn met(ask: &Self::Ask) -> bool;
+    /// Lock-free readiness check safe to run under `Lane`'s mutex.
+    /// `None` defers to `ask()` + `met()` outside the lock.
+    fn met_fast(&self) -> Option<bool> {
+        None
+    }
+    /// Whether `take_along` can currently accept another item.
+    fn can_take_along(&self) -> bool {
+        false
+    }
     /// Whether it is a present: everything before it goes first, met or not.
     fn shows(&self) -> bool;
     /// Whether it is a submission.
@@ -135,6 +145,8 @@ struct State<W> {
     /// what is behind a wait may have been written only before the wait was
     /// met, not before it was put in the line.
     floors: Vec<(usize, u64)>,
+    /// Threads currently waiting on `moved`.
+    waiters: usize,
 }
 
 impl<W> State<W> {
@@ -157,6 +169,8 @@ pub(super) struct Lane<W: Work> {
     work: Condvar,
     /// Something was done, or a look at the line ended.
     moved: Condvar,
+    dirty: AtomicBool,
+    sleeping: AtomicBool,
 }
 
 impl<W: Work> Lane<W> {
@@ -171,9 +185,12 @@ impl<W: Work> Lane<W> {
                 presents: 0,
                 runs: 0,
                 floors: Vec::new(),
+                waiters: 0,
             }),
             work: Condvar::new(),
             moved: Condvar::new(),
+            dirty: AtomicBool::new(false),
+            sleeping: AtomicBool::new(false),
         }
     }
 
@@ -187,6 +204,16 @@ impl<W: Work> Lane<W> {
         let number = state.next;
         state.next += 1;
         state.items.push_back(Entry { number, queue, what, mark });
+    }
+
+    /// Adds a single item to the end of the line without heap collection.
+    pub(super) fn push_one(&self, queue: usize, what: W) {
+        let mark = if what.runs() { W::mark_now() } else { 0 };
+        let mut state = self.lock();
+        Self::put(&mut state, queue, what, mark);
+        state.asked += 1;
+        drop(state);
+        self.work.notify_one();
     }
 
     /// Adds to the end of the line, and has it looked at.
@@ -219,13 +246,16 @@ impl<W: Work> Lane<W> {
 
     /// Has the line looked at: something an entry stands at may have moved.
     pub(super) fn wake(&self) {
-        let mut state = self.lock();
-        if state.items.is_empty() {
-            return;
+        self.dirty.store(true, std::sync::atomic::Ordering::SeqCst);
+        if self.sleeping.load(std::sync::atomic::Ordering::SeqCst) {
+            let mut state = self.lock();
+            if state.items.is_empty() {
+                return;
+            }
+            state.asked += 1;
+            drop(state);
+            self.work.notify_one();
         }
-        state.asked += 1;
-        drop(state);
-        self.work.notify_one();
     }
 
     /// Waits until everything in the line that is free to run has been done
@@ -241,42 +271,63 @@ impl<W: Work> Lane<W> {
         state.asked += 1;
         let ticket = state.asked;
         self.work.notify_one();
+        state.waiters += 1;
         while state.served < ticket {
             state = self.moved.wait(state).unwrap_or_else(|e| e.into_inner());
         }
+        state.waiters -= 1;
     }
 
     /// Waits until at most `most` presents are in the line.
     pub(super) fn wait_presents(&self, most: usize) {
         let mut state = self.lock();
+        if state.presents <= most {
+            return;
+        }
+        state.waiters += 1;
         while state.presents > most {
             state = self.moved.wait(state).unwrap_or_else(|e| e.into_inner());
         }
+        state.waiters -= 1;
     }
 
     /// Waits until at most `most` submissions are in the line, or what is
     /// left of it stands at something.
     pub(super) fn wait_runs(&self, most: usize) {
         let mut state = self.lock();
+        if !(state.runs > most && state.served < state.asked) {
+            return;
+        }
+        state.waiters += 1;
         while state.runs > most && state.served < state.asked {
             state = self.moved.wait(state).unwrap_or_else(|e| e.into_inner());
         }
+        state.waiters -= 1;
     }
 
     /// Looks at the line for as long as the process runs.
     fn serve(&self) -> ! {
+        let mut heads = Vec::new();
         loop {
             let (asked, limit) = {
                 let mut state = self.lock();
                 while state.asked == state.served {
+                    if self.dirty.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    self.sleeping.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if self.dirty.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        self.sleeping.store(false, std::sync::atomic::Ordering::SeqCst);
+                        break;
+                    }
                     if state.items.is_empty() {
                         state = self.work.wait(state).unwrap_or_else(|e| e.into_inner());
+                        self.sleeping.store(false, std::sync::atomic::Ordering::SeqCst);
                     } else {
-                        // It stands at something the CPU may write without
-                        // a call of ours.
                         let (back, out) =
                             self.work.wait_timeout(state, Duration::from_millis(1)).unwrap_or_else(|e| e.into_inner());
                         state = back;
+                        self.sleeping.store(false, std::sync::atomic::Ordering::SeqCst);
                         if out.timed_out() {
                             break;
                         }
@@ -284,72 +335,112 @@ impl<W: Work> Lane<W> {
                 }
                 (state.asked, state.next)
             };
-            self.look(limit);
-            let mut state = self.lock();
-            state.served = state.served.max(asked);
-            drop(state);
-            self.moved.notify_all();
+            while self.step(limit, &mut heads) {}
+            let notify = {
+                let mut state = self.lock();
+                state.served = state.served.max(asked);
+                state.waiters > 0
+            };
+            if notify {
+                self.moved.notify_all();
+            }
         }
     }
 
     /// Does what is free to run of the entries before number `limit`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn look(&self, limit: u64) {
-        while self.step(limit) {}
+        let mut heads = Vec::new();
+        while self.step(limit, &mut heads) {}
     }
 
-    /// The parts of `entry`, which stands for them, in place `at`.
-    fn unfold(state: &mut State<W>, at: usize, entry: Entry<W>) {
-        let (number, queue, runs, mark) = (entry.number, entry.queue, usize::from(entry.what.runs()), entry.mark);
-        let parts = entry.what.unfold();
-        state.runs -= runs;
-        state.runs += parts.iter().filter(|p| p.runs()).count();
-        for (i, what) in parts.into_iter().enumerate() {
-            state.items.insert(at + i, Entry { number, queue, what, mark });
+    fn insert_parts(
+        items: &mut VecDeque<Entry<W>>,
+        at: usize,
+        number: u64,
+        queue: usize,
+        mark: u64,
+        parts: Vec<W>,
+    ) {
+        if at == 0 {
+            for what in parts.into_iter().rev() {
+                items.push_front(Entry { number, queue, what, mark });
+            }
+        } else if at >= items.len() {
+            items.extend(parts.into_iter().map(|what| Entry { number, queue, what, mark }));
+        } else {
+            let mut tail = items.split_off(at);
+            items.extend(parts.into_iter().map(|what| Entry { number, queue, what, mark }));
+            items.append(&mut tail);
         }
     }
 
     /// Does one entry: the oldest that is the first of its queue and free to
     /// run. Whether there was one. Only one thread calls this.
-    fn step(&self, limit: u64) -> bool {
-        // Each queue's first entry, oldest first.
-        let mut heads: Vec<(u64, usize, Option<W::Ask>, bool)> = Vec::new();
-        // Whether one of them stands for others not known yet.
+    fn step(&self, limit: u64, heads: &mut Vec<(u64, usize, Option<W::Ask>, bool, Option<bool>)>) -> bool {
+        heads.clear();
         let mut folded = false;
+        let mut has_present = false;
+        let mut fast_pick: Option<(Entry<W>, u64)> = None;
+        let forces = super::forces();
         {
-            let state = self.lock();
-            for e in state.items.iter().take_while(|e| e.number < limit) {
+            let mut state = self.lock();
+            let mut first_number = None;
+            let mut fast_idx = None;
+            for (idx, e) in state.items.iter().enumerate() {
+                if e.number >= limit {
+                    break;
+                }
+                has_present |= e.what.shows();
                 if !heads.iter().any(|h| h.1 == e.queue) {
-                    heads.push((e.number, e.queue, e.what.ask(), e.what.shows()));
+                    let first = *first_number.get_or_insert(e.number);
+                    let shows = e.what.shows();
+                    let mf = e.what.met_fast();
+                    let ready_now = match mf {
+                        Some(true) => !shows || e.number == first || !forces,
+                        Some(false) => false,
+                        None => false,
+                    };
+                    if ready_now && heads.iter().all(|h| h.4 == Some(false)) && fast_idx.is_none() {
+                        fast_idx = Some(idx);
+                        break;
+                    }
+                    let ask = if mf.is_none() { e.what.ask() } else { None };
+                    heads.push((e.number, e.queue, ask, shows, mf));
                     folded |= e.what.folded();
                 }
             }
-        }
-        let Some(&(first, ..)) = heads.first() else {
-            return false;
-        };
-        let ready = heads.iter().find(|(number, _, ask, shows)| match ask {
-            Some(ask) => W::met(ask),
-            // A present comes behind everything given before it.
-            None => !shows || *number == first || !super::forces(),
-        });
-        let (number, forced) = match ready {
-            Some(head) => (head.0, false),
-            None => {
-                // Nothing is free to run. With a present in the line the
-                // oldest goes on regardless: a wait is not kept across
-                // frames (`super::present`). (Not while there is work whose
-                // parts are not known: it may be what is waited for.)
-                if folded {
-                    return false;
-                }
-                let state = self.lock();
-                if !super::forces() || !state.items.iter().any(|e| e.number < limit && e.what.shows()) {
-                    return false;
-                }
-                (first, true)
+            if let Some(idx) = fast_idx
+                && let Some(entry) = state.items.remove(idx)
+            {
+                state.running = Some(entry.queue);
+                let floor = state.floor(entry.queue);
+                fast_pick = Some((entry, floor));
             }
-        };
-        let mut entry = {
+        }
+        let (mut entry, forced, mut floor) = if let Some((entry, floor)) = fast_pick {
+            (entry, false, floor)
+        } else {
+            let Some(&(first, ..)) = heads.first() else {
+                return false;
+            };
+            let ready = heads.iter().find(|(number, _, ask, shows, mf)| match mf {
+                Some(true) => !shows || *number == first || !forces,
+                Some(false) => false,
+                None => match ask {
+                    Some(ask) => W::met(ask),
+                    None => !shows || *number == first || !forces,
+                },
+            });
+            let (number, forced) = match ready {
+                Some(head) => (head.0, false),
+                None => {
+                    if folded || !forces || !has_present {
+                        return false;
+                    }
+                    (first, true)
+                }
+            };
             let mut state = self.lock();
             let Some(at) = state.items.iter().position(|e| e.number == number) else {
                 return false;
@@ -358,32 +449,46 @@ impl<W: Work> Lane<W> {
                 return false;
             };
             state.running = Some(entry.queue);
-            entry
+            let floor = state.floor(entry.queue);
+            (entry, forced, floor)
         };
+        if entry.what.folded() {
+            let (number, queue, old_runs, mark) =
+                (entry.number, entry.queue, usize::from(entry.what.runs()), entry.mark);
+            let mut parts = entry.what.unfold();
+            let new_runs = parts.iter().filter(|p| p.runs()).count();
+            if parts.len() == 1 && !parts[0].folded() && parts[0].ask().is_none() {
+                let what = parts.pop().unwrap();
+                let mut state = self.lock();
+                state.runs = state.runs - old_runs + new_runs;
+                floor = state.floor(queue);
+                drop(state);
+                entry = Entry { number, queue, what, mark };
+            } else {
+                let notify = {
+                    let mut state = self.lock();
+                    state.running = None;
+                    state.runs = state.runs - old_runs + new_runs;
+                    let at = state.items.iter().position(|e| e.number > number).unwrap_or(state.items.len());
+                    Self::insert_parts(&mut state.items, at, number, queue, mark, parts);
+                    state.waiters > 0
+                };
+                if notify {
+                    self.moved.notify_all();
+                }
+                return true;
+            }
+        }
         let (shows, mut runs) = (entry.what.shows(), usize::from(entry.what.runs()));
-        // The highest mark of what it is made of (renderer port #7).
         let mut mark = entry.mark;
         if entry.what.ask().is_some() && !entry.what.folded() && entry.what.raises() {
-            // A wait that goes: what its queue has behind it was written
-            // before it was met, which is now at the latest.
             let later = W::mark_later();
-            self.lock().raise(entry.queue, later);
+            if later != 0 {
+                self.lock().raise(entry.queue, later);
+                floor = floor.max(later);
+            }
         }
-        if entry.what.folded() {
-            // Its parts take its place: behind everything before it, before
-            // everything after it (they share its number; the first of them
-            // is found first).
-            let mut state = self.lock();
-            state.running = None;
-            let at = state.items.iter().position(|e| e.number > entry.number).unwrap_or(state.items.len());
-            Self::unfold(&mut state, at, entry);
-            drop(state);
-            self.moved.notify_all();
-            return true;
-        }
-        // What follows it in its queue, if that can go with it. (Nobody else
-        // takes anything out, and what comes in goes to the end.)
-        while runs > 0 && !forced {
+        while runs > 0 && !forced && entry.what.can_take_along() {
             let next = {
                 let mut state = self.lock();
                 let at = state.items.iter().position(|e| e.queue == entry.queue && e.number < limit);
@@ -392,15 +497,22 @@ impl<W: Work> Lane<W> {
             let Some((at, next)) = next else {
                 break;
             };
-            // (Back where it was: parts of one submission share a number.)
             if next.what.folded() {
-                let free = next.what.ask().is_none_or(|ask| W::met(&ask));
-                let mut state = self.lock();
+                let free = match next.what.met_fast() {
+                    Some(v) => v,
+                    None => next.what.ask().is_none_or(|ask| W::met(&ask)),
+                };
                 if free {
-                    Self::unfold(&mut state, at, next);
+                    let (number, queue, old_runs, nmark) =
+                        (next.number, next.queue, usize::from(next.what.runs()), next.mark);
+                    let parts = next.what.unfold();
+                    let new_runs = parts.iter().filter(|p| p.runs()).count();
+                    let mut state = self.lock();
+                    state.runs = state.runs - old_runs + new_runs;
+                    Self::insert_parts(&mut state.items, at, number, queue, nmark, parts);
                     continue;
                 }
-                state.items.insert(at, next);
+                self.lock().items.insert(at, next);
                 break;
             }
             let Entry { number, queue, what, mark: theirs } = next;
@@ -411,7 +523,10 @@ impl<W: Work> Lane<W> {
                     mark = mark.max(theirs);
                     if waits {
                         let later = W::mark_later();
-                        self.lock().raise(queue, later);
+                        if later != 0 {
+                            self.lock().raise(queue, later);
+                            floor = floor.max(later);
+                        }
                     }
                 }
                 Err(what) => {
@@ -421,17 +536,19 @@ impl<W: Work> Lane<W> {
             }
         }
         if runs > 0 {
-            let floor = self.lock().floor(entry.queue);
             entry.what.marked(mark.max(floor));
         }
         entry.what.go(forced);
-        {
+        let notify = {
             let mut state = self.lock();
             state.running = None;
             state.presents -= usize::from(shows);
             state.runs -= runs;
+            state.waiters > 0
+        };
+        if notify {
+            self.moved.notify_all();
         }
-        self.moved.notify_all();
         true
     }
 }
@@ -543,6 +660,25 @@ impl Work for Job {
         }
     }
 
+    fn met_fast(&self) -> Option<bool> {
+        match self {
+            &Job::Wait(fence, value) => Some(crate::fence::completed(fence as This) >= value),
+            Job::Lists(_, recordings) => Some(recordings.iter().all(|r| r.done())),
+            Job::Value(wait) => wait.met().then_some(true),
+            _ => Some(true),
+        }
+    }
+
+    fn can_take_along(&self) -> bool {
+        let (most, most_lists) = crate::host::joins();
+        most >= 2
+            && match self {
+                Job::Run(_, _, order) => order.len() < most_lists,
+                Job::Joined(_, _, order, parts, _) => 1 + parts.len() < most && order.len() < most_lists,
+                _ => false,
+            }
+    }
+
     fn shows(&self) -> bool {
         matches!(self, Job::Present(..))
     }
@@ -566,8 +702,8 @@ impl Work for Job {
         match &next {
             Job::Value(wait) => {
                 let met = wait.met()
-                    || crate::host::late_met_known(wait) == Some(true)
-                    || hosts().any(|list| crate::host::will_meet(list, wait));
+                    || hosts().any(|list| crate::host::will_meet(list, wait))
+                    || crate::host::late_met_known(wait) == Some(true);
                 if !met {
                     return Err(next);
                 }
@@ -579,8 +715,11 @@ impl Work for Job {
             }
             Job::Signal(..) => {}
             Job::Run(_, more, order) => {
+                if count >= most || lists.1.len() + order.len() > most_lists {
+                    return Err(next);
+                }
                 let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| more[i].host()).collect();
-                if count >= most || lists.1.len() + runs.len() > most_lists || !crate::host::joinable(hosts(), &runs) {
+                if !crate::host::joinable(hosts(), &runs) {
                     return Err(next);
                 }
             }
@@ -832,7 +971,7 @@ pub(super) fn submit(this: This, lists: &[This]) {
         let before = QUEUED.fetch_add(1, Relaxed);
         STATS[DEPTH].fetch_add(before, Relaxed);
         STATS[DEEPEST].fetch_max(before + 1, Relaxed);
-        LANE.push(queue, [Job::Lists(queue, recordings)]);
+        LANE.push_one(queue, Job::Lists(queue, recordings));
         room(before + 1);
         return;
     }
@@ -918,7 +1057,7 @@ pub(super) fn present(
 ) {
     QUEUED.fetch_add(1, Relaxed);
     STATS[PRESENTS].fetch_add(1, Relaxed);
-    LANE.push(this as usize, [Job::Present(texture, overlay, shown)]);
+    LANE.push_one(this as usize, Job::Present(texture, overlay, shown));
     let began = Instant::now();
     let _waiting = crate::timeline::span("a present waits for the one before it to be sent");
     LANE.wait_presents(frames_most());

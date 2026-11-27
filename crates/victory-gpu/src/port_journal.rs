@@ -78,6 +78,9 @@ static PREP_FLOOR: AtomicU64 = AtomicU64::new(0);
 /// for a round begun after now. (Whether the switch is on or not: it may
 /// change in an A/B run.)
 pub(crate) fn prep_wrote() {
+    if !named() {
+        return;
+    }
     PREP_FLOOR.fetch_max(crate::descriptor::round_mark(), Relaxed);
     STATS[PREP_WRITES].fetch_add(1, Relaxed);
 }
@@ -127,11 +130,14 @@ pub(crate) fn heaps_waited(ns: u64, on: bool) {
 
 /// Whether the switch is on, or changes in this run (`VICTORY_AB`).
 fn named() -> bool {
-    #[cfg(feature = "diagnostics")]
-    if crate::ab::bit("VICTORY_PORT_JOURNAL").is_some() {
-        return true;
-    }
-    on()
+    static NAMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NAMED.get_or_init(|| {
+        #[cfg(feature = "diagnostics")]
+        if crate::ab::bit("VICTORY_PORT_JOURNAL").is_some() {
+            return true;
+        }
+        on()
+    })
 }
 
 /// Renderer port #7's line of the frame lines, per frame.
