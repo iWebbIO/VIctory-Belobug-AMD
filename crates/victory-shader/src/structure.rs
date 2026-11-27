@@ -68,6 +68,7 @@ pub struct Bools {
 
 /// The tables below have small integer keys; SipHash dominated run time.
 type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
+type Set<K> = HashSet<K, BuildHasherDefault<Fx>>;
 
 /// FxHash's multiply-rotate step.
 #[derive(Default)]
@@ -143,14 +144,17 @@ impl Bools {
     }
 
     fn vars(&self, b: Bool) -> Vec<u32> {
-        let (mut seen, mut vars, mut stack) = (Vec::new(), Vec::new(), vec![b]);
+        let mut seen = Set::default();
+        let mut in_vars = vec![false; self.atoms.len()];
+        let mut vars = Vec::new();
+        let mut stack = vec![b];
         while let Some(b) = stack.pop() {
             let (v, lo, hi) = self.nodes[b.0 as usize];
-            if v == TERMINAL || seen.contains(&b) {
+            if v == TERMINAL || !seen.insert(b) {
                 continue;
             }
-            seen.push(b);
-            if !vars.contains(&v) {
+            if !in_vars[v as usize] {
+                in_vars[v as usize] = true;
                 vars.push(v);
             }
             stack.extend([lo, hi]);
@@ -358,6 +362,7 @@ impl Bools {
         r
     }
 
+    #[allow(dead_code)]
     fn restrict(&mut self, b: Bool, v: u32, value: bool, memo: &mut Map<Bool, Bool>) -> Bool {
         let (bv, lo, hi) = self.nodes[b.0 as usize];
         if bv == TERMINAL || bv > v {
@@ -376,18 +381,91 @@ impl Bools {
         r
     }
 
-    /// `b` with each atom that `known` decides replaced by its value.
-    fn given(&mut self, mut b: Bool, known: Bool) -> Bool {
-        for v in self.vars(b) {
-            let x = self.mk(v, Bool::FALSE, Bool::TRUE);
-            let nx = self.not(x);
-            if self.implies(known, x) {
-                b = self.restrict(b, v, true, &mut Map::default());
-            } else if self.implies(known, nx) {
-                b = self.restrict(b, v, false, &mut Map::default());
+    fn forced_vars(&self, known: Bool) -> Vec<Option<bool>> {
+        let n = self.atoms.len();
+        let mut forced = vec![None; n];
+        let root_v = self.nodes[known.0 as usize].0;
+        if root_v == TERMINAL {
+            return forced;
+        }
+        let mut seen = Set::default();
+        let mut stack = vec![known];
+        let mut lo_seen = vec![false; n];
+        let mut hi_seen = vec![false; n];
+        let mut skip_diff = vec![0i32; n + 1];
+        skip_diff[0] += 1;
+        skip_diff[root_v as usize] -= 1;
+        while let Some(u) = stack.pop() {
+            if !seen.insert(u) {
+                continue;
+            }
+            let (vu, lo, hi) = self.nodes[u.0 as usize];
+            if vu == TERMINAL {
+                continue;
+            }
+            let mut edge = |c: Bool, seen_flag: &mut [bool]| {
+                if c != Bool::FALSE {
+                    seen_flag[vu as usize] = true;
+                    let vc = self.nodes[c.0 as usize].0;
+                    let end = if vc == TERMINAL { n } else { vc as usize };
+                    if (vu as usize) + 1 < end {
+                        skip_diff[(vu as usize) + 1] += 1;
+                        skip_diff[end] -= 1;
+                    }
+                    if vc != TERMINAL {
+                        stack.push(c);
+                    }
+                }
+            };
+            edge(lo, &mut lo_seen);
+            edge(hi, &mut hi_seen);
+        }
+        let mut skipped = 0i32;
+        for v in 0..n {
+            skipped += skip_diff[v];
+            if skipped == 0 {
+                forced[v] = match (lo_seen[v], hi_seen[v]) {
+                    (false, true) => Some(true),
+                    (true, false) => Some(false),
+                    _ => None,
+                };
             }
         }
-        b
+        forced
+    }
+
+    fn restrict_many(&mut self, b: Bool, forced: &[Option<bool>], memo: &mut Map<Bool, Bool>) -> Bool {
+        let (bv, lo, hi) = self.nodes[b.0 as usize];
+        if bv == TERMINAL {
+            return b;
+        }
+        if let Some(&r) = memo.get(&b) {
+            return r;
+        }
+        let r = if let Some(val) = forced[bv as usize] {
+            self.restrict_many(if val { hi } else { lo }, forced, memo)
+        } else {
+            let l = self.restrict_many(lo, forced, memo);
+            let h = self.restrict_many(hi, forced, memo);
+            self.mk(bv, l, h)
+        };
+        memo.insert(b, r);
+        r
+    }
+
+    /// `b` with each atom that `known` decides replaced by its value.
+    fn given(&mut self, mut b: Bool, known: Bool) -> Bool {
+        if b == Bool::FALSE || b == Bool::TRUE || known == Bool::TRUE {
+            return b;
+        }
+        if known == Bool::FALSE {
+            while let (v, _, hi) = self.nodes[b.0 as usize] && v != TERMINAL {
+                b = hi;
+            }
+            return b;
+        }
+        let forced = self.forced_vars(known);
+        self.restrict_many(b, &forced, &mut Map::default())
     }
 }
 
@@ -499,14 +577,14 @@ struct Lanes<'a> {
     /// Per block, in predecessor order: (block, over its taken edge).
     incoming: Vec<Vec<(usize, bool)>>,
     /// Block and instruction index writing each value.
-    defs: Map<Value, (usize, usize)>,
+    defs: Vec<Option<(usize, usize)>>,
     /// Block and index of each phi value.
-    phis: Map<Value, (usize, usize)>,
+    phis: Vec<Option<(usize, usize)>>,
     /// Mask joins found wrong when resolved to a constant: atoms instead.
-    unresolved: HashSet<Value>,
+    unresolved: Set<Value>,
     /// Phi ids whose joins depend on EXEC or VALU results (including along
     /// back edges), carried across resets so their joins stay in `masks`.
-    derived_phis: HashSet<Value>,
+    derived_phis: Set<Value>,
     b: Bools,
     /// Masks derived from EXEC and VALU results.
     masks: Map<Key, Bool>,
@@ -523,7 +601,7 @@ struct Lanes<'a> {
     /// [`Atom::Phi`] joins created in the current pass, resolved in
     /// `check_joins` and exported in `finish`.
     phi_joins: Vec<PhiJoin>,
-    phi_join_ids: HashSet<Value>,
+    phi_join_ids: Set<Value>,
     /// Per block: what a lane knows on entry, over forward edges only.
     first: Vec<Bool>,
     /// Per block ending in a branch: when a lane takes it.
@@ -534,7 +612,7 @@ struct Lanes<'a> {
     wide: HashSet<usize>,
     /// SCC values of [`Self::scc_lane`] that are set when EVERY lane's bit is (`s_cmp_eq` of
     /// two masks: "no lane differs"); the others are set when some lane's is.
-    scc_every: HashSet<Value>,
+    scc_every: Set<Value>,
     /// See [`Structured::wave_any`].
     wave_any: Vec<Option<bool>>,
 }
@@ -580,17 +658,34 @@ impl<'a> Lanes<'a> {
         }
         check_reducible(p, &order, &index)?;
         let mut incoming = vec![Vec::new(); blocks.len()];
-        let (mut defs, mut phis) = (Map::default(), Map::default());
+        let n_vals = p
+            .inputs
+            .iter()
+            .map(|i| i.1.0 as usize + 1)
+            .chain(blocks.iter().flat_map(|b| {
+                b.phis
+                    .iter()
+                    .map(|phi| phi.value.0 as usize + 1)
+                    .chain(b.insts.iter().flat_map(|i| i.writes.iter().map(|w| w.1.0 as usize + 1)))
+            }))
+            .max()
+            .unwrap_or(0);
+        let mut defs = vec![None; n_vals];
+        let mut phis = vec![None; n_vals];
         for (b, block) in blocks.iter().enumerate() {
             for (k, s) in block.exit.successors().into_iter().enumerate() {
                 incoming[s].push((b, k == 0));
             }
             for (i, phi) in block.phis.iter().enumerate() {
-                phis.insert(phi.value, (b, i));
+                if !matches!(phi.reg, Reg::V(_)) {
+                    phis[phi.value.0 as usize] = Some((b, i));
+                }
             }
             for (i, inst) in block.insts.iter().enumerate() {
-                for &(_, v) in &inst.writes {
-                    defs.insert(v, (b, i));
+                for &(reg, v) in &inst.writes {
+                    if !matches!(reg, Reg::V(_)) {
+                        defs[v.0 as usize] = Some((b, i));
+                    }
                 }
             }
         }
@@ -601,8 +696,8 @@ impl<'a> Lanes<'a> {
             incoming,
             defs,
             phis,
-            unresolved: HashSet::new(),
-            derived_phis: HashSet::new(),
+            unresolved: Set::default(),
+            derived_phis: Set::default(),
             b: Bools::new(),
             masks: Map::default(),
             other: Map::default(),
@@ -610,12 +705,12 @@ impl<'a> Lanes<'a> {
             scc_lane: Map::default(),
             joins: Vec::new(),
             phi_joins: Vec::new(),
-            phi_join_ids: HashSet::new(),
+            phi_join_ids: Set::default(),
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
             wide: HashSet::new(),
-            scc_every: HashSet::new(),
+            scc_every: Set::default(),
             wave_any: vec![None; blocks.len()],
         })
     }
@@ -672,8 +767,8 @@ impl<'a> Lanes<'a> {
             // EXEC where known in this block (read or written so far).
             let mut now = None;
             for (i, inst) in p.blocks[b].insts.iter().enumerate() {
-                if inst.read(Reg::S(EXEC)).is_some() {
-                    let e = self.exec(inst);
+                if let Some(k) = self.key(|r| inst.read(r), EXEC) {
+                    let e = self.mask(k).0;
                     execs[b][i] = Some(e);
                     now = Some(e);
                 }
@@ -886,7 +981,7 @@ impl<'a> Lanes<'a> {
     }
 
     fn born(&self, v: Value) -> usize {
-        match (self.defs.get(&v), self.phis.get(&v)) {
+        match (self.defs.get(v.0 as usize).and_then(|x| x.as_ref()), self.phis.get(v.0 as usize).and_then(|x| x.as_ref())) {
             (Some(&(b, _)), _) | (_, Some(&(b, _))) => self.index[b],
             _ => 0,
         }
@@ -912,7 +1007,7 @@ impl<'a> Lanes<'a> {
         let (m, derived) = match self.join(k) {
             Some(join) => join,
             None => {
-                let (lo, hi) = (self.defs.get(&k.0).copied(), self.defs.get(&k.1).copied());
+                let (lo, hi) = (self.defs.get(k.0.0 as usize).copied().flatten(), self.defs.get(k.1.0 as usize).copied().flatten());
                 let def = |d: Option<(usize, usize)>| d.map(|(b, i)| &p.blocks[b].insts[i]);
                 let m = match (lo, hi) {
                     (Some(at), Some(hi)) if at == hi => def(lo)
@@ -956,7 +1051,7 @@ impl<'a> Lanes<'a> {
     /// is that constant, for a lane can only read it after arriving.
     fn join(&mut self, k: Key) -> Option<(Bool, bool)> {
         let p = self.p;
-        let (lo, hi) = (self.phis.get(&k.0).copied(), self.phis.get(&k.1).copied());
+        let (lo, hi) = (self.phis.get(k.0.0 as usize).copied().flatten(), self.phis.get(k.1.0 as usize).copied().flatten());
         let block = match (lo, hi) {
             (Some((a, _)), Some((b, _))) if a != b => return None,
             (Some((b, _)), _) | (_, Some((b, _))) => b,
@@ -1133,7 +1228,7 @@ impl<'a> Lanes<'a> {
     /// with EXEC empty. A read inside the loop or behind another way out of it sees a
     /// join of this value, not the value itself.
     fn clear_after_loop(&self, scc: Value) -> bool {
-        let Some(&(b, i)) = self.defs.get(&scc) else {
+        let Some(&(b, i)) = self.defs.get(scc.0 as usize).and_then(|x| x.as_ref()) else {
             return false;
         };
         let block = &self.p.blocks[b];
@@ -1201,7 +1296,7 @@ impl<'a> Lanes<'a> {
                         && code != NULL
                         && let Some(k) = self.key(|r| inst.read(r), code)
                     {
-                        let phi = self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1);
+                        let phi = self.phis.get(k.0.0 as usize).is_some_and(Option::is_some) || self.phis.get(k.1.0 as usize).is_some_and(Option::is_some);
                         takes_mask |= self.masks.contains_key(&k) || phi && self.mask(k).1;
                     }
                 }
@@ -1265,11 +1360,11 @@ impl<'a> Lanes<'a> {
                 }
             }
             Fields::Valu(v) => {
-                let exec = self.exec(inst);
                 let lane = |l: &mut Self, k: Key| {
+                    let e = exec.unwrap_or_else(|| l.exec(inst));
                     let born = l.born(k.0);
                     let a = l.b.atom(Atom::Lane(k.0), born);
-                    let m = l.b.and(exec, a);
+                    let m = l.b.and(e, a);
                     l.masks.insert(k, m);
                     l.active.insert(k.0);
                 };

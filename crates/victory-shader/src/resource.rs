@@ -242,7 +242,7 @@ pub fn track(
                     first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
                 }
                 if let Source::Loaded { load, .. } = source
-                    && out.scalar.iter().any(|s| s.0 == load)
+                    && out.scalar.binary_search_by_key(&load, |s| s.0).is_ok()
                     && let Some(v) = t.first_lane_offset(load)
                 {
                     offset.push((v, load));
@@ -459,11 +459,9 @@ impl<'a> Tracer<'a> {
                 }
             }
         }
+        let order = crate::ir::reverse_postorder(&p.blocks);
         let mut rpo = vec![usize::MAX; p.blocks.len()];
-        for (n, b) in crate::ir::reverse_postorder(&p.blocks)
-            .into_iter()
-            .enumerate()
-        {
+        for (n, &b) in order.iter().enumerate() {
             rpo[b] = n;
         }
         let mut t = Tracer {
@@ -481,44 +479,84 @@ impl<'a> Tracer<'a> {
             rpo,
             at: Default::default(),
         };
-        t.origin = t.propagate_copies(n)?;
+        t.origin = t.propagate_copies(&order, n)?;
         Ok(t)
     }
 
     /// Optimistic copy propagation: a move's result is its source's
     /// origin, a phi's the one origin its arguments agree on.
-    fn propagate_copies(&self, n: usize) -> Result<Vec<Term>, ShaderError> {
+    fn propagate_copies(&self, order: &[usize], n: usize) -> Result<Vec<Term>, ShaderError> {
         let mut o: Vec<Option<Term>> = vec![None; n];
         for &(_, v) in &self.p.inputs {
             o[v.0 as usize] = Some(Term::Value(v));
         }
-        let order = crate::ir::reverse_postorder(&self.p.blocks);
-        for _ in 0..MAX_ROUNDS {
-            let mut changed = false;
-            for &b in &order {
-                let block = &self.p.blocks[b];
-                for phi in &block.phis {
-                    let own = Term::Value(phi.value);
-                    let mut args = phi
-                        .args
-                        .iter()
-                        .filter_map(|a| o[a.0 as usize])
-                        .filter(|&t| t != own);
-                    let new = args
-                        .next()
-                        .map(|first| if args.all(|t| t == first) { first } else { own });
-                    if new.is_some() && new != o[phi.value.0 as usize] {
-                        o[phi.value.0 as usize] = new;
-                        changed = true;
+        enum Work {
+            Phi(usize, usize),
+            Copy(Value, Value),
+        }
+        let has_phis = order.iter().any(|&b| !self.p.blocks[b].phis.is_empty());
+        let mut work = Vec::new();
+        for &b in order {
+            let block = &self.p.blocks[b];
+            for (i, phi) in block.phis.iter().enumerate() {
+                let own = Term::Value(phi.value);
+                let mut args = phi
+                    .args
+                    .iter()
+                    .filter_map(|a| o[a.0 as usize])
+                    .filter(|&t| t != own);
+                let new = args
+                    .next()
+                    .map(|first| if args.all(|t| t == first) { first } else { own });
+                if new.is_some() {
+                    o[phi.value.0 as usize] = new;
+                }
+                work.push(Work::Phi(b, i));
+            }
+            for inst in &block.insts {
+                for (k, &(_, v)) in inst.writes.iter().enumerate() {
+                    match copy_source(inst, k).or_else(|| self.restored(inst)) {
+                        Some(Moved::Const(c)) => o[v.0 as usize] = Some(Term::Const(c)),
+                        Some(Moved::Value(s)) => {
+                            o[v.0 as usize] = o[s.0 as usize];
+                            if has_phis {
+                                work.push(Work::Copy(v, s));
+                            }
+                        }
+                        None => o[v.0 as usize] = Some(Term::Value(v)),
                     }
                 }
-                for inst in &block.insts {
-                    for (k, &(_, v)) in inst.writes.iter().enumerate() {
-                        let new = match copy_source(inst, k).or_else(|| self.restored(inst)) {
-                            Some(Moved::Const(c)) => Some(Term::Const(c)),
-                            Some(Moved::Value(s)) => o[s.0 as usize],
-                            None => Some(Term::Value(v)),
-                        };
+            }
+        }
+        if !has_phis {
+            return Ok(o
+                .into_iter()
+                .enumerate()
+                .map(|(v, t)| t.unwrap_or(Term::Value(Value(v as u32))))
+                .collect());
+        }
+        for _ in 1..MAX_ROUNDS {
+            let mut changed = false;
+            for item in &work {
+                match *item {
+                    Work::Phi(b, i) => {
+                        let phi = &self.p.blocks[b].phis[i];
+                        let own = Term::Value(phi.value);
+                        let mut args = phi
+                            .args
+                            .iter()
+                            .filter_map(|a| o[a.0 as usize])
+                            .filter(|&t| t != own);
+                        let new = args
+                            .next()
+                            .map(|first| if args.all(|t| t == first) { first } else { own });
+                        if new.is_some() && new != o[phi.value.0 as usize] {
+                            o[phi.value.0 as usize] = new;
+                            changed = true;
+                        }
+                    }
+                    Work::Copy(v, s) => {
+                        let new = o[s.0 as usize];
                         if new.is_some() && new != o[v.0 as usize] {
                             o[v.0 as usize] = new;
                             changed = true;

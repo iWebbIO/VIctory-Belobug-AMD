@@ -294,6 +294,12 @@ fn unspill(
             _ => None,
         }
     }
+    if !list
+        .iter()
+        .any(|i| matches!(i.name(), Some("v_writelane_b32" | "v_readlane_b32")))
+    {
+        return Vec::new();
+    }
     // VGPRs used by parking alone, the scalar codes the program uses, and
     // per instruction the scalar codes it writes.
     let mut stores = [false; 256];
@@ -312,14 +318,16 @@ fn unspill(
         let mut codes = Vec::new();
         let mut from = Vec::new();
         if let Some((reads, writes)) = effects {
-            for &reg in &writes {
-                if let Reg::S(c) = reg {
-                    codes.push(c);
+            if wave64 {
+                for &reg in &writes {
+                    if let Reg::S(c) = reg {
+                        codes.push(c);
+                    }
                 }
-            }
-            for &reg in &reads {
-                if let Reg::S(c) = reg {
-                    from.push(c);
+                for &reg in &reads {
+                    if let Reg::S(c) = reg {
+                        from.push(c);
+                    }
                 }
             }
             // An M0-relative read (`v_movrels_b32`) names every VGPR from its
@@ -346,6 +354,9 @@ fn unspill(
     }
     let leader = |i: usize| leaders.binary_search(&list[i].offset).is_ok();
     for reg in 0..256 {
+        if !stores[reg] {
+            continue;
+        }
         let Some(last) = other[reg] else { continue };
         let of = |p: &Option<(bool, u8, u8, u32)>| p.filter(|p| usize::from(p.1) == reg);
         let first = parks.iter().position(|p| of(p).is_some_and(|p| p.0));
