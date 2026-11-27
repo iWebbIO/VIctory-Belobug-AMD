@@ -67,8 +67,19 @@ impl Shard {
     /// (renderer port #7) another asking with a higher number may have
     /// noted it first.
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
-        let before = self.written.get(&page).copied().unwrap_or(0);
-        self.written.insert(page, before.max(now));
+        let before = match self.written.entry(page) {
+            std::collections::btree_map::Entry::Occupied(mut e) => {
+                let prev = *e.get();
+                if now > prev {
+                    *e.get_mut() = now;
+                }
+                prev
+            }
+            std::collections::btree_map::Entry::Vacant(e) => {
+                e.insert(now);
+                0
+            }
+        };
         if parts == WHOLE || !parts_on() {
             if now >= before {
                 self.parts.remove(&page);
@@ -87,6 +98,7 @@ impl Shard {
     }
 
     /// The parts of `page` written by an asking after `taken`.
+    #[allow(dead_code)]
     fn parts_since(&self, page: usize, taken: u64) -> u16 {
         match self.parts.get(&page) {
             Some(all) => all.iter().enumerate().filter(|(_, at)| **at > taken).fold(0, |m, (k, _)| m | 1 << k),
@@ -127,7 +139,10 @@ fn shards_of_pages(pages: impl IntoIterator<Item = usize>) -> u64 {
 /// holder changes them with no part's lock; held shared, a reader reads a
 /// part at a time, and who notes or needs a number that counts holds the
 /// parts it touches ([`Notes::hold`]).
-struct Notes([RwLock<Shard>; SHARDS]);
+#[repr(align(64))]
+struct AlignedShard(RwLock<Shard>);
+
+struct Notes([AlignedShard; SHARDS]);
 
 /// A part of [`Notes`].
 struct Shard {
@@ -141,21 +156,21 @@ struct Shard {
 
 impl Notes {
     const fn new() -> Notes {
-        Notes([const { RwLock::new(Shard::new()) }; SHARDS])
+        Notes([const { AlignedShard(RwLock::new(Shard::new())) }; SHARDS])
     }
 
     /// The part of `page`, with the journal held alone.
     fn shard_mut(&mut self, page: usize) -> &mut Shard {
-        self.0[shard_of(page)].get_mut().unwrap_or_else(|e| e.into_inner())
+        self.0[shard_of(page)].0.get_mut().unwrap_or_else(|e| e.into_inner())
     }
 
     /// A part to read, the journal held shared or alone.
     fn read(&self, shard: usize) -> std::sync::RwLockReadGuard<'_, Shard> {
-        if let Ok(s) = self.0[shard].try_read() {
+        if let Ok(s) = self.0[shard].0.try_read() {
             return s;
         }
         let began = std::time::Instant::now();
-        let s = self.0[shard].read().unwrap_or_else(|e| e.into_inner());
+        let s = self.0[shard].0.read().unwrap_or_else(|e| e.into_inner());
         port7_waited(P7_PART_WAITS, began);
         s
     }
@@ -208,7 +223,7 @@ impl Notes {
         while m != 0 {
             let shard = m.trailing_zeros() as usize;
             m &= m - 1;
-            let lock = &self.0[shard];
+            let lock = &self.0[shard].0;
             if write {
                 let guard = match lock.try_write() {
                     Ok(g) => g,
@@ -293,8 +308,24 @@ impl Held<'_> {
 /// the asking it took the page at): the parts to take again, a bit for each
 /// 4 KiB, in the same order.
 pub(crate) fn parts_written(pages: &[(usize, u64)]) -> Vec<u16> {
+    if pages.is_empty() {
+        return Vec::new();
+    }
+    if !parts_on() {
+        return vec![WHOLE; pages.len()];
+    }
     let j = journal();
-    pages.iter().map(|&(page, taken)| j.notes.parts_since(page, taken)).collect()
+    let mut out = Vec::with_capacity(pages.len());
+    let mut cached: Option<(usize, std::sync::RwLockReadGuard<'_, Shard>)> = None;
+    for &(page, taken) in pages {
+        let shard = shard_of(page);
+        if cached.as_ref().is_none_or(|(s, _)| *s != shard) {
+            drop(cached.take());
+            cached = Some((shard, j.notes.read(shard)));
+        }
+        out.push(cached.as_ref().unwrap().1.parts_since(page, taken));
+    }
+    out
 }
 
 /// Numbers the askings; 0 is "never". Counted up with the journal held
@@ -2714,10 +2745,31 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // takes the block out of the set, and it is looked at as any other.
     let unsure: Vec<usize> = {
         let of = |g: &Guards| -> Option<Vec<usize>> {
-            if g.clean.range(first..last).count() == last - first && !BESIDE.any(first, last) {
+            if (first >= last || g.clean.0.all(first, last)) && !BESIDE.any(first, last) {
                 return None;
             }
-            Some(g.absent.range(first..last).filter(|block| !g.held.contains(*block)).collect())
+            let mut unsure = Vec::new();
+            let mut word = first / 64;
+            let end_word = last.div_ceil(64);
+            while word < end_word {
+                let Some(absent_piece) = g.absent.0.piece(word) else {
+                    word = (word / Bits::WORDS + 1) * Bits::WORDS;
+                    continue;
+                };
+                let held_piece = g.held.0.piece(word);
+                let piece_end = ((word / Bits::WORDS + 1) * Bits::WORDS).min(end_word);
+                while word < piece_end {
+                    let a = absent_piece[word % Bits::WORDS].load(std::sync::atomic::Ordering::SeqCst);
+                    if a != 0 {
+                        let h = held_piece
+                            .map_or(0, |p| p[word % Bits::WORDS].load(std::sync::atomic::Ordering::SeqCst));
+                        let bits = a & !h & in_word(word * 64, first, last);
+                        unsure.extend(BitsOf(bits).map(|bit| word * 64 + bit));
+                    }
+                    word += 1;
+                }
+            }
+            Some(unsure)
         };
         // (Renderer port #6: shared, a look only. A block a fault opens
         // meanwhile was clean, read-only and unwritten when looked at.)
@@ -3341,14 +3393,16 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
             return;
         }
     }
-    {
+    let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
+    if PROTECTED.any(first, last) {
         let g = guards();
-        let guarded = g.protected.range(at / BLOCK..end.div_ceil(BLOCK)).count() as u64;
-        if pages {
+        let guarded = if mode & 1 != 0 {
+            open(&g, at, end) as u64
+        } else {
+            g.protected.range(first..last).count() as u64
+        };
+        if pages && guarded != 0 {
             WRITTEN[2].fetch_add(guarded, Relaxed);
-        }
-        if mode & 1 != 0 && guarded != 0 {
-            open(&g, at, end);
         }
     }
     // A placed texture there changed with no descriptor written.
