@@ -4265,17 +4265,19 @@ impl Shadow {
         bytes
     }
 
-    /// What shaders wrote in `[from, to)` (offsets) was put into title memory.
-    fn note_landing(&self, from: usize, to: usize) {
+    /// What shaders wrote in each `(from, to)` offset range was put into title memory.
+    fn note_landings(&self, ranges: &[(usize, usize)]) {
         let first = self.start as usize / KERNEL_PAGE;
-        let pages = (self.start as usize + from) / KERNEL_PAGE - first..(self.start as usize + to).div_ceil(KERNEL_PAGE) - first;
         let mut bits = self.landings.lock().unwrap_or_else(|e| e.into_inner());
         if bits.is_empty() {
             let all = (self.start + self.len).div_ceil(KERNEL_PAGE as u64) as usize - first;
             bits.resize(all.div_ceil(64), 0);
         }
-        for page in pages {
-            bits[page / 64] |= 1 << (page % 64);
+        for &(from, to) in ranges {
+            let pages = (self.start as usize + from) / KERNEL_PAGE - first..(self.start as usize + to).div_ceil(KERNEL_PAGE) - first;
+            for page in pages {
+                bits[page / 64] |= 1 << (page % 64);
+            }
         }
         self.landing.store(true, Ordering::Release);
     }
@@ -4860,19 +4862,7 @@ impl Shadow {
             put += merged;
         }
         if !landed.is_empty() {
-            let first = self.start as usize / KERNEL_PAGE;
-            let mut bits = self.landings.lock().unwrap_or_else(|e| e.into_inner());
-            if bits.is_empty() {
-                let all = (self.start + self.len).div_ceil(KERNEL_PAGE as u64) as usize - first;
-                bits.resize(all.div_ceil(64), 0);
-            }
-            for (lo, hi) in landed {
-                let pages = (self.start as usize + lo) / KERNEL_PAGE - first..(self.start as usize + hi).div_ceil(KERNEL_PAGE) - first;
-                for page in pages {
-                    bits[page / 64] |= 1 << (page % 64);
-                }
-            }
-            self.landing.store(true, Ordering::Release);
+            self.note_landings(&landed);
         }
         put
     }

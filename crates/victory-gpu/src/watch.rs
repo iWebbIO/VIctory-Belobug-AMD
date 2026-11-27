@@ -180,11 +180,6 @@ impl Notes {
         self.shard_mut(page).note(page, parts, now)
     }
 
-    /// See [`Shard::parts_since`].
-    fn parts_since(&self, page: usize, taken: u64) -> u16 {
-        self.read(shard_of(page)).parts_since(page, taken)
-    }
-
     /// The notes of pages `[first, last)` in page order, `each` of them
     /// until it says no: whether it never did. A part at a time.
     fn each(&self, first: usize, last: usize, mut each: impl FnMut(usize, u64) -> bool) -> bool {
