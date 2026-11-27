@@ -2174,32 +2174,47 @@ unsafe fn word_runs_avx2(title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut push = |from: usize, len: usize| match runs.last_mut() {
         Some((a, n)) if *a + *n == from => *n += len,
-        _ => runs.push((from, len)),
+        _ => {
+            if runs.is_empty() {
+                runs.reserve(64);
+            }
+            runs.push((from, len));
+        }
     };
     let n = title.len();
+    let ones = _mm256_set1_epi32(-1);
     let mut i = 0;
-    while i + 256 <= n {
-        let mut differ = 0u64;
-        for k in 0..8 {
-            // SAFETY: inside both slices (`i + 256 <= n`).
-            let same = unsafe {
-                _mm256_cmpeq_epi32(
-                    _mm256_loadu_si256(title.as_ptr().add(i + 32 * k).cast()),
-                    _mm256_loadu_si256(held.as_ptr().add(i + 32 * k).cast()),
-                )
-            };
-            differ |= u64::from(!_mm256_movemask_ps(_mm256_castsi256_ps(same)) as u8) << (8 * k);
-        }
-        while differ != 0 {
-            let first = differ.trailing_zeros();
-            let count = (differ >> first).trailing_ones();
-            push(i + 4 * first as usize, 4 * count as usize);
-            if first + count >= 64 {
-                break;
+    while i + 128 <= n {
+        // SAFETY: inside both slices (`i + 128 <= n`).
+        unsafe {
+            let tp = title.as_ptr().add(i);
+            let hp = held.as_ptr().add(i);
+            let eq0 = _mm256_cmpeq_epi32(_mm256_loadu_si256(tp.cast()), _mm256_loadu_si256(hp.cast()));
+            let eq1 = _mm256_cmpeq_epi32(_mm256_loadu_si256(tp.add(32).cast()), _mm256_loadu_si256(hp.add(32).cast()));
+            let eq2 = _mm256_cmpeq_epi32(_mm256_loadu_si256(tp.add(64).cast()), _mm256_loadu_si256(hp.add(64).cast()));
+            let eq3 = _mm256_cmpeq_epi32(_mm256_loadu_si256(tp.add(96).cast()), _mm256_loadu_si256(hp.add(96).cast()));
+            let all_eq = _mm256_and_si256(_mm256_and_si256(eq0, eq1), _mm256_and_si256(eq2, eq3));
+            if _mm256_testc_si256(all_eq, ones) == 0 {
+                let m0 = !_mm256_movemask_ps(_mm256_castsi256_ps(eq0)) as u8;
+                let m1 = !_mm256_movemask_ps(_mm256_castsi256_ps(eq1)) as u8;
+                let m2 = !_mm256_movemask_ps(_mm256_castsi256_ps(eq2)) as u8;
+                let m3 = !_mm256_movemask_ps(_mm256_castsi256_ps(eq3)) as u8;
+                let mut differ = u32::from(m0)
+                    | (u32::from(m1) << 8)
+                    | (u32::from(m2) << 16)
+                    | (u32::from(m3) << 24);
+                while differ != 0 {
+                    let first = differ.trailing_zeros();
+                    let count = (differ >> first).trailing_ones();
+                    push(i + 4 * first as usize, 4 * count as usize);
+                    if first + count >= 32 {
+                        break;
+                    }
+                    differ &= u32::MAX << (first + count);
+                }
             }
-            differ &= u64::MAX << (first + count);
         }
-        i += 256;
+        i += 128;
     }
     while i + 4 <= n {
         if title[i..i + 4] != held[i..i + 4] {
@@ -2246,35 +2261,58 @@ unsafe fn word_runs_put_avx2(title: &[u8], held: &mut [u8]) -> Vec<(usize, usize
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut push = |from: usize, len: usize| match runs.last_mut() {
         Some((a, n)) if *a + *n == from => *n += len,
-        _ => runs.push((from, len)),
+        _ => {
+            if runs.is_empty() {
+                runs.reserve(64);
+            }
+            runs.push((from, len));
+        }
     };
     let n = title.len();
+    let ones = _mm256_set1_epi32(-1);
     let mut i = 0;
-    while i + 256 <= n {
-        let mut differ = 0u64;
-        for k in 0..8 {
-            let at = i + 32 * k;
-            // SAFETY: inside both slices (`i + 256 <= n`).
-            unsafe {
-                let now = _mm256_loadu_si256(title.as_ptr().add(at).cast());
-                let old = _mm256_loadu_si256(held.as_ptr().add(at).cast());
-                let block = !_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(now, old))) as u8;
-                if block != 0 {
-                    _mm256_storeu_si256(held.as_mut_ptr().add(at).cast(), now);
+    while i + 128 <= n {
+        // SAFETY: inside both slices (`i + 128 <= n`).
+        unsafe {
+            let tp = title.as_ptr().add(i);
+            let hp = held.as_mut_ptr().add(i);
+            let now0 = _mm256_loadu_si256(tp.cast());
+            let now1 = _mm256_loadu_si256(tp.add(32).cast());
+            let now2 = _mm256_loadu_si256(tp.add(64).cast());
+            let now3 = _mm256_loadu_si256(tp.add(96).cast());
+
+            let eq0 = _mm256_cmpeq_epi32(now0, _mm256_loadu_si256(hp.cast()));
+            let eq1 = _mm256_cmpeq_epi32(now1, _mm256_loadu_si256(hp.add(32).cast()));
+            let eq2 = _mm256_cmpeq_epi32(now2, _mm256_loadu_si256(hp.add(64).cast()));
+            let eq3 = _mm256_cmpeq_epi32(now3, _mm256_loadu_si256(hp.add(96).cast()));
+
+            let all_eq = _mm256_and_si256(_mm256_and_si256(eq0, eq1), _mm256_and_si256(eq2, eq3));
+            if _mm256_testc_si256(all_eq, ones) == 0 {
+                let m0 = !_mm256_movemask_ps(_mm256_castsi256_ps(eq0)) as u8;
+                let m1 = !_mm256_movemask_ps(_mm256_castsi256_ps(eq1)) as u8;
+                let m2 = !_mm256_movemask_ps(_mm256_castsi256_ps(eq2)) as u8;
+                let m3 = !_mm256_movemask_ps(_mm256_castsi256_ps(eq3)) as u8;
+                if m0 != 0 { _mm256_storeu_si256(hp.cast(), now0); }
+                if m1 != 0 { _mm256_storeu_si256(hp.add(32).cast(), now1); }
+                if m2 != 0 { _mm256_storeu_si256(hp.add(64).cast(), now2); }
+                if m3 != 0 { _mm256_storeu_si256(hp.add(96).cast(), now3); }
+
+                let mut differ = u32::from(m0)
+                    | (u32::from(m1) << 8)
+                    | (u32::from(m2) << 16)
+                    | (u32::from(m3) << 24);
+                while differ != 0 {
+                    let first = differ.trailing_zeros();
+                    let count = (differ >> first).trailing_ones();
+                    push(i + 4 * first as usize, 4 * count as usize);
+                    if first + count >= 32 {
+                        break;
+                    }
+                    differ &= u32::MAX << (first + count);
                 }
-                differ |= u64::from(block) << (8 * k);
             }
         }
-        while differ != 0 {
-            let first = differ.trailing_zeros();
-            let count = (differ >> first).trailing_ones();
-            push(i + 4 * first as usize, 4 * count as usize);
-            if first + count >= 64 {
-                break;
-            }
-            differ &= u64::MAX << (first + count);
-        }
-        i += 256;
+        i += 128;
     }
     while i + 4 <= n {
         if title[i..i + 4] != held[i..i + 4] {
@@ -2756,16 +2794,23 @@ mod piece_tests {
 /// shaders read zeros there (fxceless/victory-fork#206: missing geometry
 /// with `VICTORY_LATE_WAIT`/`VICTORY_RELAY`).
 fn stale_pages_in(base: usize, copied: &[u64], a: usize, e: usize, written: &[(usize, u64)]) -> Vec<usize> {
-    (a / PAGE..e.div_ceil(PAGE))
-        .filter(|&page| page >= base)
-        .filter(|&page| match copied.get(page - base) {
-            None => false,
-            Some(0) => true,
-            Some(&at) => written
-                .binary_search_by_key(&page, |&(p, _)| p)
-                .is_ok_and(|i| written[i].1 > at),
-        })
-        .collect()
+    let first = (a / PAGE).max(base);
+    let last = e.div_ceil(PAGE).min(base + copied.len());
+    if first >= last {
+        return Vec::new();
+    }
+    let mut idx = written.partition_point(|&(p, _)| p < first);
+    let mut out = Vec::new();
+    for page in first..last {
+        while idx < written.len() && written[idx].0 < page {
+            idx += 1;
+        }
+        let at = copied[page - base];
+        if at == 0 || (idx < written.len() && written[idx].0 == page && written[idx].1 > at) {
+            out.push(page);
+        }
+    }
+    out
 }
 
 /// `runs` (from, to, whether the copy held it before), cut in those of pages
@@ -4769,25 +4814,65 @@ impl Shadow {
             sent.near(fetched_after, from, to, &mut skip);
             skip
         };
+        let skip = if skip.is_empty() { skip } else { joined(skip) };
+        let mut parts: Vec<(usize, usize)> = Vec::new();
+        let mut landed: Vec<(usize, usize)> = Vec::new();
         let mut put = 0;
         for &(lo, hi, now) in pieces {
             if lo >= hi || hi > self.len as usize {
                 continue;
             }
-            let near: Vec<(usize, usize)> = skip.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
-            let parts: Vec<(usize, usize)> = outside(lo, hi, near).into_iter().map(|(a, b)| (a - lo, b - lo)).collect();
+            let single = [(0, hi - lo)];
+            let slice: &[(usize, usize)] = if skip.is_empty() {
+                &single
+            } else {
+                parts.clear();
+                let idx = skip.partition_point(|r| r.1 <= lo);
+                let mut at = lo;
+                for &(a, b) in &skip[idx..] {
+                    if a >= hi {
+                        break;
+                    }
+                    if a > at {
+                        parts.push((at - lo, a - lo));
+                    }
+                    at = at.max(b);
+                    if at >= hi {
+                        break;
+                    }
+                }
+                if at < hi {
+                    parts.push((at - lo, hi - lo));
+                }
+                &parts
+            };
             // SAFETY: inside the mapping (checked above), in a range
             // declared and not done with, which no refresh writes; the
             // title's bytes are kept out by the lock; the caller's.
             // Where title memory is not mapped the CPU's side keeps what
             // the card wrote, as before.
             let merged =
-                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), &parts, true, notes, self) };
+                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), slice, true, notes, self) };
             self.walls_merged(hi - lo, merged as usize);
             if merged > 0 {
-                self.note_landing(lo, hi);
+                landed.push((lo, hi));
             }
             put += merged;
+        }
+        if !landed.is_empty() {
+            let first = self.start as usize / KERNEL_PAGE;
+            let mut bits = self.landings.lock().unwrap_or_else(|e| e.into_inner());
+            if bits.is_empty() {
+                let all = (self.start + self.len).div_ceil(KERNEL_PAGE as u64) as usize - first;
+                bits.resize(all.div_ceil(64), 0);
+            }
+            for (lo, hi) in landed {
+                let pages = (self.start as usize + lo) / KERNEL_PAGE - first..(self.start as usize + hi).div_ceil(KERNEL_PAGE) - first;
+                for page in pages {
+                    bits[page / 64] |= 1 << (page % 64);
+                }
+            }
+            self.landing.store(true, Ordering::Release);
         }
         put
     }
